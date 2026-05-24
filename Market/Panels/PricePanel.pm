@@ -34,7 +34,7 @@ use constant {
 # new
 # -----------------------------------------------------------------------------
 sub new {
-    my ($class, %args) = @_;
+    my ( $class, %args ) = @_;
     my $self = {
         canvas        => $args{canvas},
         scale         => undef,
@@ -115,7 +115,7 @@ sub round {
 # set_scale
 # -----------------------------------------------------------------------------
 sub set_scale {
-    my ($self, $scale) = @_;
+    my ( $self, $scale ) = @_;
     $self->{scale} = $scale;
 }
 

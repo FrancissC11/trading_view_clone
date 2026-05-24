@@ -15,14 +15,23 @@ package Market::Panels::ATRPanel;
 use strict;
 use warnings;
 
+# ------------------------------------------------------------------------------
+# Paleta clara estilo TradingView Light
+# ------------------------------------------------------------------------------
+
 use constant {
     COLOR_ATR   => '#b71c1c',
     COLOR_CROSS => '#9598a1',
     BG_COLOR    => '#ffffff',
 };
 
+# ------------------------------------------------------------------------------
+# new
+# Inicializa el panel ATR.
+# ------------------------------------------------------------------------------
 sub new {
     my ($class, %args) = @_;
+
     my $self = {
         canvas        => $args{canvas},
         scale         => undef,
@@ -33,6 +42,7 @@ sub new {
         _ch_label     => undef,
         _cross_ready  => 0,
     };
+
     bless $self, $class;
     return $self;
 }
@@ -43,6 +53,7 @@ sub new {
 # -----------------------------------------------------------------------------
 sub _init_crosshair {
     my ($self) = @_;
+
     my $c = $self->{canvas};
     return unless $c;
     return if $self->{_cross_ready};
@@ -101,6 +112,7 @@ sub get_y_range {
 # -----------------------------------------------------------------------------
 sub set_scale {
     my ($self, $scale) = @_;
+
     $self->{scale} = $scale;
 }
 

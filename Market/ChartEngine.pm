@@ -128,7 +128,10 @@ sub round {
 # -----------------------------------------------------------------------------
 sub request_render {
     my ($self) = @_;
-    return if $self->{_render_pending};
+
+    return
+      if $self->{_render_pending};
+
     $self->{_render_pending} = 1;
     $self->{canvas_price}->after(1, sub {
         $self->{_render_pending} = 0;
@@ -977,7 +980,7 @@ sub _draw_crosshair_all {
 # Cambia la temporalidad: reconstruye indicadores y resetea la vista.
 # -----------------------------------------------------------------------------
 sub set_timeframe {
-    my ($self, $tf) = @_;
+    my ( $self, $tf ) = @_;
     $self->{market}->set_timeframe($tf);
     $self->{indicators}->reset_all;
     $self->{indicators}->rebuild_all($self->{market});
