@@ -50,7 +50,7 @@ my $CANVAS_W      = $WIN_W;
 my $mw = MainWindow->new;
 $mw->title('Chart Test');
 $mw->geometry("${WIN_W}x${WIN_H}");
-$mw->resizable(0, 0);
+$mw->resizable(1, 1);
 $mw->configure(-background => '#f1f3f6');
 
 # Barra superior de temporalidades + zoom
@@ -59,13 +59,10 @@ my $tf_frame = $mw->Frame(-background => '#f1f3f6', -height => $TF_BAR_H)
 
 # Canvas principal de precios
 my $canvas_price = $mw->Canvas(
-    -width              => $CANVAS_W,
-    -height             => $PRICE_H,
     -background         => '#ffffff',
     -bd                 => 0,
     -highlightthickness => 0,
-)->pack(-fill => 'x', -side => 'top');
-$canvas_price->configure(-scrollregion => [0, 0, $CANVAS_W, $PRICE_H]);
+)->pack(-fill => 'both', -expand => 1, -side => 'top');
 
 # Separador entre paneles
 $mw->Frame(-background => '#c9cdd7', -height => $SEP_H)
@@ -73,13 +70,11 @@ $mw->Frame(-background => '#c9cdd7', -height => $SEP_H)
 
 # Canvas del indicador ATR
 my $canvas_atr = $mw->Canvas(
-    -width              => $CANVAS_W,
     -height             => $ATR_H,
     -background         => '#ffffff',
     -bd                 => 0,
     -highlightthickness => 0,
 )->pack(-fill => 'x', -side => 'top');
-$canvas_atr->configure(-scrollregion => [0, 0, $CANVAS_W, $ATR_H]);
 
 # =============================================================================
 # DATOS
