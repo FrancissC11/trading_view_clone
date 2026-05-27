@@ -1174,69 +1174,122 @@ sub reset_view {
 
 # -----------------------------------------------------------------------------
 # compute_intraday_labels
-# Combina las anclas "naturales" (cambio de dia/hora del MarketData) con
-# anclas INTERMEDIAS automaticas que se distribuyen uniformemente para
-# llenar el eje cuando los cambios de hora estan muy espaciados.
+# Genera etiquetas para el eje X adaptadas al zoom, comenzando desde la
+# hora exacta de la primera vela visible.
 #
-# Objetivo: ~20 etiquetas visibles, adaptadas al zoom actual.
+# Algoritmo de deteccion por transicion de slot:
+#   1. Detectar duracion de la vela activa (tf_minutes).
+#   2. Elegir un paso "bonito" en minutos segun el zoom.
+#   3. Iterar velas visibles. Para cada vela se calcula su "slot"
+#      (= floor(hora_local_en_minutos / step_min)).
+#   4. Cuando el slot cambia respecto a la vela anterior, se coloca un tick
+#      con la etiqueta del INICIO del nuevo slot (tiempo redondeado bonito).
+#      Esto funciona aunque las velas no esten alineadas al reloj UTC, ya que
+#      se usa el string de tiempo local de la vela, no el epoch.
+#   5. Primera vela visible: siempre se coloca un tick con su hora exacta
+#      (ancla de inicio que pide el profesor).
+#   6. Cambios de dia: etiqueta "DowName DD" en lugar de hora.
 # -----------------------------------------------------------------------------
 sub compute_intraday_labels {
     my ( $self, $start, $end ) = @_;
 
-    # 1) Anclas naturales del MarketData (cambios de dia/hora)
-    my $all = $self->{market}->compute_time_anchors;
-    my @nat = grep { $_->{index} >= $start && $_->{index} <= $end } @$all;
-
-    # 2) Calcular cuantas etiquetas caben visualmente (~20)
     my $visible = $end - $start + 1;
-    return \@nat if $visible <= 0;
+    return [] if $visible <= 0;
 
-    my $target = 20;
-    my $stride = int( $visible / $target );
-    $stride = 1 if $stride < 1;
+    # ------------------------------------------------------------------
+    # 1. Duracion de vela en minutos segun el timeframe activo
+    # ------------------------------------------------------------------
+    my %tf_min = ( '1m' => 1, '5m' => 5, '15m' => 15 );
+    my $tf      = $self->{market}->get_timeframe;
+    my $bar_min = $tf_min{$tf} // 1;
 
-    # 3) Marcar indices ya ocupados por anclas naturales
-    my %used;
-    for my $a (@nat) { $used{ $a->{index} } = 1; }
-
-    # 4) Generar anclas intermedias en multiplos de $stride.
-    my @intermediate;
-    my $i = $start;
-    while ( $i <= $end ) {
-        unless ( $used{$i} ) {
-            my $candle = $self->{market}->get_candle($i);
-            if ( $candle && defined $candle->{time} ) {
-                my $lbl = '';
-                if ( $candle->{time} =~ /T(\d{2}):(\d{2})/ ) {
-                    $lbl = "$1:$2";
-                }
-                push @intermediate,
-                  {
-                    index => $i,
-                    label => $lbl,
-                    ts    => $candle->{ts},
-                  };
-            }
+    # ------------------------------------------------------------------
+    # 2. Paso de tiempo "bonito": el menor que da <= 12 etiquetas visibles
+    # ------------------------------------------------------------------
+    my @nice    = ( 1, 2, 5, 10, 15, 20, 30, 60, 120, 240, 360, 720, 1440 );
+    my $step_min = $nice[-1];
+    for my $s (@nice) {
+        next if $s < $bar_min;
+        if ( $visible / ( $s / $bar_min ) <= 12 ) {
+            $step_min = $s;
+            last;
         }
-        $i += $stride;
     }
 
-    # 5) Combinar y ordenar por indice
-    my @combined = sort { $a->{index} <=> $b->{index} } ( @nat, @intermediate );
-
-    # 6) Filtro anti-colision: si dos anclas quedan muy cerca (< stride/2),
-    # priorizar la natural (cambio de hora/dia).
-    my @final;
-    my $last_idx = -999999;
-    my $min_gap  = int( $stride / 2 );
+    # ------------------------------------------------------------------
+    # 3. Parametros anti-colision
+    # ------------------------------------------------------------------
+    my $min_gap = int( $step_min / $bar_min / 2 );
     $min_gap = 1 if $min_gap < 1;
-    for my $a (@combined) {
-        if ( $a->{index} - $last_idx >= $min_gap ) {
-            push @final, $a;
-            $last_idx = $a->{index};
+
+    my @DAY_ABBR = qw(Sun Mon Tue Wed Thu Fri Sat);
+    my @result;
+    my $last_placed_idx = -999999;
+    my $last_slot       = -1;
+    my $last_day        = -1;
+    my $first_bar       = 1;
+
+    # ------------------------------------------------------------------
+    # 4. Iterar velas visibles
+    # ------------------------------------------------------------------
+    for my $i ( $start .. $end ) {
+        my $c = $self->{market}->get_candle($i);
+        next unless $c;
+
+        # Leer hora/min del string de tiempo local de la vela
+        # (inmune a desalineacion de epoch causada por gaps intraday)
+        next
+          unless defined $c->{time}
+          && $c->{time} =~ /\d{4}-\d{2}-(\d{2})T(\d{2}):(\d{2})/;
+
+        my ( $mday, $hour, $min ) = ( $1 + 0, $2 + 0, $3 + 0 );
+        my $cur_slot = int( ( $hour * 60 + $min ) / $step_min );
+
+        # -----------------------------------------------------------------
+        # Primera vela visible: ancla de inicio con la hora exacta
+        # -----------------------------------------------------------------
+        if ($first_bar) {
+            my $label = sprintf( '%d:%02d', $hour, $min );
+            push @result,
+              { index => $i, label => $label, ts => $c->{ts} };
+            $last_placed_idx = $i;
+            $last_day        = $mday;
+            $last_slot       = $cur_slot;
+            $first_bar       = 0;
+            next;
         }
+
+        my $day_change  = ( $mday != $last_day );
+        my $slot_change = ( $cur_slot != $last_slot );
+
+        # Actualizar estado SIEMPRE (cada transicion dispara una sola vez)
+        $last_day  = $mday;
+        $last_slot = $cur_slot;
+
+        next unless $day_change || $slot_change;
+        next if $i - $last_placed_idx < $min_gap;
+
+        # -----------------------------------------------------------------
+        # Construir etiqueta
+        # -----------------------------------------------------------------
+        my $label;
+        if ($day_change) {
+            # Cambio de dia: "Mon 27"
+            my $wday = ( gmtime( $c->{ts} ) )[6];
+            $label = $DAY_ABBR[$wday] . ' ' . $mday;
+        }
+        else {
+            # Mismo dia: mostrar el inicio del slot (tiempo redondeado)
+            my $slot_h = int( $cur_slot * $step_min / 60 );
+            my $slot_m = ( $cur_slot * $step_min ) % 60;
+            $label = sprintf( '%d:%02d', $slot_h, $slot_m );
+        }
+
+        push @result, { index => $i, label => $label, ts => $c->{ts} };
+        $last_placed_idx = $i;
     }
-    return \@final;
+
+    return \@result;
 }
 
 # -----------------------------------------------------------------------------
