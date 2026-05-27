@@ -32,6 +32,7 @@ sub new {
         canvas_w      => $args{canvas_w}      // 800,
         canvas_h      => $args{canvas_h}      // 400,
         price_scale_w => $args{price_scale_w} // 90,
+        visual_offset => $args{visual_offset} // 0,
         visible_bars  => $args{visible_bars}  // 100,
         offset        => $args{offset}        // 0,
         min_val       => $args{min_val}       // 0,
@@ -84,8 +85,16 @@ sub index_to_x {
 # -----------------------------------------------------------------------------
 sub x_to_index {
     my ($self, $x) = @_;
+
     my $bar_w = $self->_plot_w / $self->{visible_bars};
-    return floor($x / $bar_w) + $self->{offset};
+
+    my $idx = int(
+        ($x / $bar_w)
+        + $self->{offset}
+        - $self->{visual_offset}
+    );
+
+    return $idx;
 }
 
 # -----------------------------------------------------------------------------
@@ -103,9 +112,13 @@ sub x_to_index_float {
 # indice -> X del centro de la barra
 # -----------------------------------------------------------------------------
 sub index_to_center_x {
-    my ($self, $index) = @_;
+    my ($self, $idx) = @_;
+
     my $bar_w = $self->_plot_w / $self->{visible_bars};
-    return ($index - $self->{offset}) * $bar_w + $bar_w / 2;
+
+    return (
+        ($idx - $self->{offset} + $self->{visual_offset}) * $bar_w
+    ) + ($bar_w / 2);
 }
 
 # -----------------------------------------------------------------------------
