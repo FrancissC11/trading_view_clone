@@ -3,17 +3,17 @@
 # =============================================================================
 # market.pl
 # Punto de entrada del sistema de visualizacion de datos de mercado.
-# Carga datos OHLCV de un CSV, construye temporalidades (1m, 5m, 15m),
-# calcula indicadores (ATR), ensambla el motor de chart y arranca el GUI.
 #
 # Controles:
 #   Rueda                : zoom horizontal (ancla borde derecho)
-#   Ctrl + Rueda         : zoom vertical del panel bajo el mouse
+#   Ctrl + Rueda         : zoom horizontal (ancla vela bajo el mouse)
+#   Shift + Rueda        : zoom vertical del panel bajo el mouse
 #   Drag boton 1         : scroll horizontal (tiempo)
 #   Click simple boton 1 : marca persistente (precio + hora)
 #   Doble clic boton 1   : borra marca persistente
 #   Drag boton derecho   : zoom/pan vertical del panel bajo el mouse
 #   Doble clic boton der : restaurar escala Y automatica
+#   Drag separador ATR   : redimensionar panel ATR (price se ajusta solo)
 #   Botones 1m/5m/15m    : cambio de temporalidad
 # =============================================================================
 
@@ -33,23 +33,19 @@ use Market::Panels::ATRPanel;
 use Market::ChartEngine;
 
 # =============================================================================
-# VENTANA  (creamos primero para poder leer screenwidth/screenheight)
+# VENTANA
 # =============================================================================
 my $mw = MainWindow->new;
 $mw->title('Chart Test');
 $mw->resizable(1, 1);
-$mw->configure(-background => '#f1f3f6');
+$mw->configure(-background => '#1c1f2b');
 
-# --- Pantalla completa al iniciar -------------------------------------------
-eval { $mw->state('zoomed') };          # Windows / algunos WM de Linux
-eval { $mw->attributes('-zoomed', 1) }; # EWMH (KDE, GNOME, Xfwm...)
+eval { $mw->state('zoomed') };
+eval { $mw->attributes('-zoomed', 1) };
 $mw->update;
 
-# =============================================================================
-# DIMENSIONES
-# =============================================================================
-my $WIN_W         = $mw->screenwidth;
-my $WIN_H         = $mw->screenheight;
+my $WIN_W = $mw->screenwidth;
+my $WIN_H = $mw->screenheight;
 
 if ($mw->width < $WIN_W * 0.9) {
     $mw->geometry("${WIN_W}x${WIN_H}+0+0");
@@ -59,29 +55,42 @@ if ($mw->width < $WIN_W * 0.9) {
 $WIN_W = $mw->width  if $mw->width  > 100;
 $WIN_H = $mw->height if $mw->height > 100;
 
+# =============================================================================
+# DIMENSIONES INICIALES
+# =============================================================================
 my $PRICE_SCALE_W = 90;
 my $TF_BAR_H      = 28;
-my $ATR_H         = 140;
-my $SEP_H         = 2;
-my $PRICE_H       = $WIN_H - $TF_BAR_H - $ATR_H - $SEP_H - 4;
+my $SEP_H         = 6;          # altura del separador arrastrable
+my $ATR_H_MIN     = 60;         # altura minima del panel ATR
+my $ATR_H_MAX     = 400;        # altura maxima del panel ATR
+my $ATR_H         = 140;        # altura inicial del panel ATR
 my $CANVAS_W      = $WIN_W;
 
-# Barra superior de temporalidades + zoom
+# =============================================================================
+# LAYOUT: toolbar | canvas_price | separador | canvas_atr
+# Usamos pack con expand/fill para que canvas_price absorba el espacio libre.
+# =============================================================================
+
+# --- Toolbar ---
 my $tf_frame = $mw->Frame(-background => '#f1f3f6', -height => $TF_BAR_H)
     ->pack(-fill => 'x', -side => 'top');
 
-# Canvas principal de precios
+# --- Canvas de precios (ocupa todo el espacio restante) ---
 my $canvas_price = $mw->Canvas(
     -background         => '#ffffff',
     -bd                 => 0,
     -highlightthickness => 0,
 )->pack(-fill => 'both', -expand => 1, -side => 'top');
 
-# Separador entre paneles
-$mw->Frame(-background => '#c9cdd7', -height => $SEP_H)
-    ->pack(-fill => 'x', -side => 'top');
+# --- Separador arrastrable ---
+# Frame con cursor de resize vertical para indicar que es draggable.
+my $sep_frame = $mw->Frame(
+    -background => '#c9cdd7',   # gris suave, igual que los bordes del grafico
+    -height     => 4,
+    -cursor     => 'sb_v_double_arrow',
+)->pack(-fill => 'x', -side => 'top');
 
-# Canvas del indicador ATR
+# --- Canvas ATR (altura fija inicial, se ajusta con el drag) ---
 my $canvas_atr = $mw->Canvas(
     -height             => $ATR_H,
     -background         => '#ffffff',
@@ -102,7 +111,7 @@ for my $cand ('data/2026_03.csv', '2026_03.csv', '../data/2026_03.csv') {
 die "No se encuentra 2026_03.csv (buscado en data/ y .)\n" unless $csv_path;
 
 open my $fh, '<', $csv_path or die "Error abriendo CSV '$csv_path': $!\n";
-<$fh>;  # descartar header
+<$fh>;
 my $count = 0;
 while (<$fh>) {
     chomp;
@@ -116,9 +125,9 @@ while (<$fh>) {
     $market->add_candle({
         time   => $time_str,
         ts     => $tm->epoch,
-        open   => $open + 0,
-        high   => $high + 0,
-        low    => $low  + 0,
+        open   => $open  + 0,
+        high   => $high  + 0,
+        low    => $low   + 0,
         close  => $close + 0,
         volume => $volume + 0,
     });
@@ -154,6 +163,8 @@ my $atr_panel = Market::Panels::ATRPanel->new(
     price_scale_w => $PRICE_SCALE_W,
 );
 
+# La altura inicial del canvas_price la calcula Tk via pack/expand.
+# Le pasamos 0 de placeholder; el handler <Configure> del engine la actualizara.
 my $engine = Market::ChartEngine->new(
     market         => $market,
     indicators     => $ind_manager,
@@ -162,12 +173,63 @@ my $engine = Market::ChartEngine->new(
     price_panel    => $price_panel,
     atr_panel      => $atr_panel,
     canvas_w       => $CANVAS_W,
-    canvas_price_h => $PRICE_H,
+    canvas_price_h => 0,
     canvas_atr_h   => $ATR_H,
 );
 
 # =============================================================================
-# TOOLBAR (botones + selector de temporalidad)
+# DRAG DEL SEPARADOR: redimensiona ATR y deja que price_panel se expanda
+# =============================================================================
+{
+    my $drag_y_start  = undef;
+    my $drag_atr_h    = undef;
+    my $drag_pending  = 0;
+
+    $sep_frame->bind('<ButtonPress-1>', sub {
+        $drag_y_start = $_[0]->XEvent->Y;  # coordenada root Y
+        $drag_atr_h   = $canvas_atr->height;
+    });
+
+    $sep_frame->bind('<B1-Motion>', sub {
+        return unless defined $drag_y_start;
+        my $dy = $drag_y_start - $_[0]->XEvent->Y;  # positivo = subir sep = ATR mas alto
+        my $new_h = $drag_atr_h + $dy;
+        $new_h = $ATR_H_MIN if $new_h < $ATR_H_MIN;
+        $new_h = $ATR_H_MAX if $new_h > $ATR_H_MAX;
+
+        # Ajustar altura del canvas ATR; canvas_price se expande automaticamente
+        $canvas_atr->configure(-height => $new_h);
+
+        # Notificar al engine las nuevas dimensiones y re-renderizar.
+        # NO llamar $mw->update aqui — dispara <Configure> en loop.
+        # Leemos canvas_price->height ANTES de que Tk relayoutee,
+        # el engine tomara las dimensiones reales en render() directamente.
+        $engine->resize_panels(
+            $canvas_price->width,
+            $canvas_price->height - ($new_h - $drag_atr_h),
+            $new_h,
+        );
+    });
+
+    $sep_frame->bind('<ButtonRelease-1>', sub {
+        $drag_y_start = undef;
+        $drag_atr_h   = undef;
+    });
+
+    # Doble clic en el separador: restaurar altura por defecto del ATR
+    $sep_frame->bind('<Double-Button-1>', sub {
+        $canvas_atr->configure(-height => 140);
+        $mw->update;
+        $engine->resize_panels(
+            $canvas_price->width,
+            $canvas_price->height,
+            140,
+        );
+    });
+}
+
+# =============================================================================
+# TOOLBAR
 # =============================================================================
 my %bs = (
     -background       => '#f1f3f6',
@@ -184,18 +246,16 @@ my %bs = (
 $tf_frame->Label(%bs, -text => 'Zoom')
     ->pack(-side => 'left', -padx => 6, -pady => 2);
 
-# Botones de zoom horizontal (anclan siempre al borde derecho)
 $tf_frame->Button(%bs, -text => '+',
-    -command => sub { $engine->_horizontal_zoom( -1, 0 ) })
+    -command => sub { $engine->_horizontal_zoom(-1, 0) })
     ->pack(-side => 'left', -padx => 1, -pady => 2);
 $tf_frame->Button(%bs, -text => '-',
-    -command => sub { $engine->_horizontal_zoom( 1, 0 ) })
+    -command => sub { $engine->_horizontal_zoom(1, 0) })
     ->pack(-side => 'left', -padx => 1, -pady => 2);
 
 $tf_frame->Frame(-background => '#c9cdd7', -width => 1, -height => 16)
     ->pack(-side => 'left', -pady => 5, -padx => 6);
 
-# Etiqueta de temporalidad activa
 my $active_tf = '1m';
 my $tf_lbl = $tf_frame->Label(%bs,
     -text       => '1m',
@@ -203,7 +263,6 @@ my $tf_lbl = $tf_frame->Label(%bs,
     -font       => 'TkDefaultFont 9 bold',
 )->pack(-side => 'left', -padx => 4, -pady => 2);
 
-# Botones de temporalidad
 my %tf_btns;
 for my $tf (qw(1m 5m 15m)) {
     my $btn = $tf_frame->Button(%bs,
@@ -226,7 +285,7 @@ for my $tf (qw(1m 5m 15m)) {
 $tf_btns{'1m'}->configure(-foreground => '#2962ff');
 
 $tf_frame->Label(%bs,
-    -text       => 'Rueda: zoom  |  Ctrl+Rueda: zoom ancla mouse  |  Shift+Rueda: zoom V  |  Drag izq: scroll  |  Click izq: marca regleta  |  Drag der: zoom V  |  Dbl-clic der: auto',
+    -text       => 'Rueda: zoom  |  Ctrl+Rueda: zoom ancla mouse  |  Shift+Rueda: zoom V  |  Drag izq: scroll  |  Drag sep: resize ATR  |  Dbl-sep: reset ATR',
     -foreground => '#787b86',
     -font       => 'TkDefaultFont 7',
 )->pack(-side => 'right', -padx => 10);

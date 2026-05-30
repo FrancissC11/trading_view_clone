@@ -2,8 +2,7 @@ package Market::ChartEngine;
 
 # =============================================================================
 # Market::ChartEngine
-# Orquestador del sistema de visualizacion: une datos, indicadores, paneles
-# y eventos del usuario. Punto de ensamblaje del sistema visual.
+# Orquestador del sistema de visualizacion.
 # =============================================================================
 
 use strict;
@@ -58,11 +57,6 @@ sub new {
         _price_cross => undef,
         _atr_cross   => undef,
 
-        # Anchor de zoom CTRL:
-        # Al primer CTRL+scroll se captura el indice absoluto de la vela
-        # bajo el mouse y su X en pixeles. Mientras CTRL este presionado,
-        # _horizontal_zoom usa estos valores fijos — el mouse NO se mueve
-        # y la vela siempre queda en el mismo pixel X de pantalla.
         _ctrl_pressed    => 0,
         _zoom_anchor_idx => undef,
         _zoom_anchor_px  => undef,
@@ -70,6 +64,27 @@ sub new {
     bless $self, $class;
     $self->bind_events;
     return $self;
+}
+
+# -----------------------------------------------------------------------------
+# resize_panels
+# Llamado desde market.pl cuando el usuario arrastra el separador ATR.
+# Actualiza las dimensiones internas y re-renderiza.
+# -----------------------------------------------------------------------------
+sub resize_panels {
+    my ( $self, $new_w, $new_ph, $new_ah ) = @_;
+    return if $new_w  <= 1 || $new_ph <= 1 || $new_ah <= 1;
+
+    $self->{canvas_w}       = $new_w;
+    $self->{canvas_price_h} = $new_ph;
+    $self->{canvas_atr_h}   = $new_ah;
+
+    $self->{canvas_price}->configure(
+        -scrollregion => [ 0, 0, $new_w, $new_ph ] );
+    $self->{canvas_atr}->configure(
+        -scrollregion => [ 0, 0, $new_w, $new_ah ] );
+
+    $self->request_render;
 }
 
 # -----------------------------------------------------------------------------
@@ -142,19 +157,29 @@ sub render {
     my $canv_ah = $self->{canvas_atr_h};
     my $total   = $self->{market}->size;
 
-    my $safe_start = $start < 0        ? 0        : $start;
-    my $safe_end   = $end >= $total    ? $total-1 : $end;
+    # Leer dimensiones reales del canvas por si cambiaron via pack/expand
+    my $real_ph = $self->{canvas_price}->height;
+    my $real_ah = $self->{canvas_atr}->height;
+    my $real_w  = $self->{canvas_price}->width;
+    $canv_ph = $real_ph if $real_ph > 1;
+    $canv_ah = $real_ah if $real_ah > 1;
+    $canv_w  = $real_w  if $real_w  > 1;
+    $self->{canvas_w}       = $canv_w;
+    $self->{canvas_price_h} = $canv_ph;
+    $self->{canvas_atr_h}   = $canv_ah;
+
+    my $safe_start = $start < 0     ? 0        : $start;
+    my $safe_end   = $end >= $total ? $total-1 : $end;
     $safe_end = $safe_start if $safe_end < $safe_start;
 
     my $visible_candles = $self->{market}->get_slice( $safe_start, $safe_end );
     my $visible_atr     = $self->{indicators}->slice_array( 'atr', $start, $end );
-    my $real_bars       = $self->{visible_bars} < 1 ? 1 : $self->{visible_bars};
 
+    # --- Escala precios ---
     my ( $min_p, $max_p );
     if ( $self->{zoom_y_auto} ) {
         ( $min_p, $max_p ) = $self->{price_panel}->get_y_range($visible_candles);
-    }
-    else {
+    } else {
         ( $min_p, $max_p ) = @{ $self->{y_range_price} };
     }
     my $last_visible = $visible_candles->[-1];
@@ -175,11 +200,11 @@ sub render {
     $self->{price_panel}->set_scale($scale_price);
     $self->{_scale_price} = $scale_price;
 
+    # --- Escala ATR (propia, independiente del precio) ---
     my ( $min_a, $max_a );
     if ( $self->{zoom_y_auto_atr} ) {
         ( $min_a, $max_a ) = $self->{atr_panel}->get_y_range($visible_atr);
-    }
-    else {
+    } else {
         ( $min_a, $max_a ) = @{ $self->{y_range_atr} };
     }
     my $last_atr_val;
@@ -203,6 +228,7 @@ sub render {
     $self->{atr_panel}->set_scale($scale_atr);
     $self->{_scale_atr} = $scale_atr;
 
+    # --- Render panel precios ---
     $self->{canvas_price}->delete('price_bg');
     $self->{canvas_price}->delete('candle');
     $self->{canvas_price}->delete('scale_bg');
@@ -214,12 +240,16 @@ sub render {
 
     $self->{price_panel}->render( $self->{canvas_price}, $visible_candles, $scale_price );
 
+    # Ultimo precio visible en regleta Y del panel de precios
+    $self->{price_panel}->render_last_visible_price( $self->{canvas_price} );
+
     my $anchors = $self->compute_intraday_labels( $start, $end );
     $self->{price_panel}->draw_time_axis( $self->{canvas_price}, $anchors );
 
     $self->{price_panel}->_init_crosshair_objects;
     $self->_draw_price_cross;
 
+    # --- Render panel ATR ---
     $self->{canvas_atr}->delete('atr_all');
     $self->{canvas_atr}->delete('scale_bg');
     $self->{canvas_atr}->delete('scale_border');
@@ -227,6 +257,10 @@ sub render {
     $self->{canvas_atr}->delete('scale_label');
 
     $self->{atr_panel}->render( $self->{canvas_atr}, $visible_atr, $scale_atr );
+
+    # Etiqueta del ultimo valor ATR visible en la regleta Y del panel ATR
+    $self->{atr_panel}->render_last_visible_value( $self->{canvas_atr} );
+
     $self->{atr_panel}->_init_crosshair;
     $self->_draw_atr_cross;
 
@@ -250,16 +284,14 @@ sub bind_events {
     my $hit_test = sub {
         my ( $abs_x, $abs_y ) = @_;
 
-        my $cpx = $cp->rootx;
-        my $cpy = $cp->rooty;
+        my $cpx = $cp->rootx; my $cpy = $cp->rooty;
         if (   $abs_x >= $cpx && $abs_x < $cpx + $cp->width
             && $abs_y >= $cpy && $abs_y < $cpy + $cp->height )
         {
             return ( 'price', $abs_x - $cpx, $abs_y - $cpy );
         }
 
-        my $cax = $ca->rootx;
-        my $cay = $ca->rooty;
+        my $cax = $ca->rootx; my $cay = $ca->rooty;
         if (   $abs_x >= $cax && $abs_x < $cax + $ca->width
             && $abs_y >= $cay && $abs_y < $cay + $ca->height )
         {
@@ -270,7 +302,7 @@ sub bind_events {
     };
 
     # =========================================================================
-    # CTRL press/release: congela y descongela el anchor de zoom
+    # CTRL press/release: congela anchor de zoom
     # =========================================================================
     for my $key (qw(Control_L Control_R)) {
         $toplevel->bind(
@@ -278,10 +310,7 @@ sub bind_events {
             sub {
                 return if $self->{_ctrl_pressed};
                 $self->{_ctrl_pressed} = 1;
-
-                # Capturar anchor solo si hay escala y mouse valido
                 return unless $self->{_scale_price} && $self->{_mouse_x} >= 0;
-
                 my $idx = $self->{_scale_price}->x_to_index( $self->{_mouse_x} );
                 $self->{_zoom_anchor_idx} = $idx;
                 $self->{_zoom_anchor_px}  = $self->{_mouse_x};
@@ -298,9 +327,7 @@ sub bind_events {
     }
 
     # =========================================================================
-    # RUEDA sola    -> zoom horizontal, ancla borde derecho
-    # CTRL + Rueda  -> zoom horizontal, ancla vela congelada bajo el mouse
-    # Shift + Rueda -> zoom vertical del panel bajo el mouse
+    # RUEDA
     # =========================================================================
     $toplevel->bind(
         '<Button-4>',
@@ -312,9 +339,7 @@ sub bind_events {
             if ($shift) {
                 $self->_vertical_zoom_price(0.9) if $self->{_mouse_in_price};
                 $self->_vertical_zoom_atr(0.9)   if $self->{_mouse_in_atr};
-            }
-            else {
-                # Si ctrl activo y aun no hay anchor, capturarlo ahora
+            } else {
                 if ( $ctrl && !defined $self->{_zoom_anchor_idx}
                     && $self->{_scale_price} && $self->{_mouse_x} >= 0 )
                 {
@@ -338,8 +363,7 @@ sub bind_events {
             if ($shift) {
                 $self->_vertical_zoom_price(1.1) if $self->{_mouse_in_price};
                 $self->_vertical_zoom_atr(1.1)   if $self->{_mouse_in_atr};
-            }
-            else {
+            } else {
                 if ( $ctrl && !defined $self->{_zoom_anchor_idx}
                     && $self->{_scale_price} && $self->{_mouse_x} >= 0 )
                 {
@@ -355,7 +379,7 @@ sub bind_events {
     );
 
     # =========================================================================
-    # MOTION: si CTRL activo, NO actualizar _mouse_x (crosshair congelado)
+    # MOTION
     # =========================================================================
     $toplevel->bind(
         '<Motion>',
@@ -373,7 +397,6 @@ sub bind_events {
                 return;
             }
 
-            # Con CTRL activo el crosshair esta congelado: no mover
             return if $self->{_ctrl_pressed};
 
             if ( $panel eq 'price' ) {
@@ -381,8 +404,7 @@ sub bind_events {
                 $self->{_mouse_in_atr}   = 0;
                 $self->{_mouse_x}        = $lx;
                 $self->{_mouse_y}        = $ly;
-            }
-            else {
+            } else {
                 $self->{_mouse_in_atr}   = 1;
                 $self->{_mouse_in_price} = 0;
                 $self->{_mouse_x}        = $lx;
@@ -402,19 +424,13 @@ sub bind_events {
             my ( $panel, $lx, $ly ) = $hit_test->( $ev->X, $ev->Y );
             return unless defined $panel;
 
-            if ( $panel eq 'price' ) {
-                $self->{_mouse_in_price} = 1;
-                $self->{_mouse_in_atr}   = 0;
-            }
-            else {
-                $self->{_mouse_in_atr}   = 1;
-                $self->{_mouse_in_price} = 0;
-            }
-            $self->{_drag_start_x} = $lx;
-            $self->{_drag_start_y} = $ly;
-            $self->{_drag_offset}  = $self->{offset};
-            $self->{_drag_moved}   = 0;
-            $self->{_drag_panel}   = $panel;
+            $self->{_mouse_in_price} = $panel eq 'price' ? 1 : 0;
+            $self->{_mouse_in_atr}   = $panel eq 'atr'   ? 1 : 0;
+            $self->{_drag_start_x}   = $lx;
+            $self->{_drag_start_y}   = $ly;
+            $self->{_drag_offset}    = $self->{offset};
+            $self->{_drag_moved}     = 0;
+            $self->{_drag_panel}     = $panel;
         }
     );
 
@@ -471,8 +487,7 @@ sub bind_events {
                     value => $scale->y_to_value($ly),
                 };
                 $self->_draw_price_cross;
-            }
-            elsif ( $panel eq 'atr' && $self->{_scale_atr} ) {
+            } elsif ( $panel eq 'atr' && $self->{_scale_atr} ) {
                 my $scale = $self->{_scale_atr};
                 return if $lx > $scale->_plot_w;
                 $self->{_atr_cross} = {
@@ -485,7 +500,7 @@ sub bind_events {
     );
 
     # =========================================================================
-    # DOBLE CLICK IZQUIERDO: borrar cruz persistente
+    # DOBLE CLICK IZQUIERDO
     # =========================================================================
     $toplevel->bind(
         '<Double-Button-1>',
@@ -496,11 +511,23 @@ sub bind_events {
             if ( $panel eq 'price' ) {
                 $self->{_price_cross} = undef;
                 $self->{canvas_price}->delete('price_cross');
-            }
-            else {
+            } else {
                 $self->{_atr_cross} = undef;
                 $self->{canvas_atr}->delete('atr_cross');
             }
+        }
+    );
+
+    # =========================================================================
+    # ESC: borra AMBAS marcas persistentes de una sola vez
+    # =========================================================================
+    $toplevel->bind(
+        '<Escape>',
+        sub {
+            $self->{_price_cross} = undef;
+            $self->{_atr_cross}   = undef;
+            $self->{canvas_price}->delete('price_cross');
+            $self->{canvas_atr}->delete('atr_cross');
         }
     );
 
@@ -523,8 +550,7 @@ sub bind_events {
                     $self->{y_range_price} = [ $mn, $mx ];
                 }
                 $self->{zoom_y_auto} = 0;
-            }
-            else {
+            } else {
                 $self->{_drag_y_start_atr} = $ly;
                 unless ( $self->{y_range_atr} ) {
                     my ( $s, $e ) = $self->compute_window;
@@ -553,8 +579,7 @@ sub bind_events {
                 my $dy = $ly - ( $self->{_drag_y_start} // $ly );
                 $self->{_drag_y_start} = $ly;
                 $self->_vertical_drag($dy);
-            }
-            else {
+            } else {
                 my $dy = $ly - ( $self->{_drag_y_start_atr} // $ly );
                 $self->{_drag_y_start_atr} = $ly;
                 $self->_vertical_drag_atr($dy);
@@ -571,8 +596,7 @@ sub bind_events {
             if ( $panel eq 'price' ) {
                 $self->{zoom_y_auto}   = 1;
                 $self->{y_range_price} = undef;
-            }
-            else {
+            } else {
                 $self->{zoom_y_auto_atr} = 1;
                 $self->{y_range_atr}     = undef;
             }
@@ -581,7 +605,9 @@ sub bind_events {
     );
 
     # =========================================================================
-    # RESIZE
+    # RESIZE de ventana (no de paneles — ese lo maneja resize_panels)
+    # Solo reacciona si cambio el ancho o la altura del canvas de precios
+    # por redimension de ventana, NO por el drag del separador ATR.
     # =========================================================================
     $toplevel->bind(
         '<Configure>',
@@ -590,17 +616,18 @@ sub bind_events {
             my $new_h  = $self->{canvas_price}->height;
             my $new_ah = $self->{canvas_atr}->height;
 
-            return if $new_w <= 1 || $new_h <= 1;
-            return
-                if $new_w == $self->{canvas_w}
-                && $new_h == $self->{canvas_price_h}
-                && $new_ah == $self->{canvas_atr_h};
+            return if $new_w  <= 1 || $new_h <= 1;
+            return if $new_w  == $self->{canvas_w}
+                   && $new_h  == $self->{canvas_price_h}
+                   && $new_ah == $self->{canvas_atr_h};
 
             $self->{canvas_w}       = $new_w;
             $self->{canvas_price_h} = $new_h;
             $self->{canvas_atr_h}   = $new_ah;
-            $self->{canvas_price}->configure( -scrollregion => [ 0, 0, $new_w, $new_h ] );
-            $self->{canvas_atr}->configure( -scrollregion => [ 0, 0, $new_w, $new_ah ] );
+            $self->{canvas_price}->configure(
+                -scrollregion => [ 0, 0, $new_w, $new_h ] );
+            $self->{canvas_atr}->configure(
+                -scrollregion => [ 0, 0, $new_w, $new_ah ] );
             $self->request_render;
         }
     );
@@ -608,15 +635,6 @@ sub bind_events {
 
 # -----------------------------------------------------------------------------
 # _horizontal_zoom
-# $dir  : -1 = acercar, +1 = alejar
-# $ctrl : 0  = anclar borde derecho
-#         1  = anclar vela congelada (_zoom_anchor_idx / _zoom_anchor_px)
-#
-# Formula CTRL (TradingView):
-#   new_offset = anchor_idx - floor(anchor_px / bar_w_new)
-#
-# Con esto: el pixel anchor_px siempre muestra anchor_idx.
-# El mouse fisico no se mueve, la vela no se mueve, todo lo demas escala.
 # -----------------------------------------------------------------------------
 sub _horizontal_zoom {
     my ( $self, $dir, $ctrl ) = @_;
@@ -628,17 +646,12 @@ sub _horizontal_zoom {
 
     if ( $ctrl && defined $self->{_zoom_anchor_idx} && $self->{_scale_price} ) {
         my $anchor_idx = $self->{_zoom_anchor_idx};
-        my $anchor_px  = $self->{_zoom_anchor_px};  # pixel fisico del mouse, NO cambia
+        my $anchor_px  = $self->{_zoom_anchor_px};
         my $plot_w     = $self->{_scale_price}->_plot_w;
         my $bar_w_new  = $plot_w / $new;
-        # Formula: el pixel anchor_px debe seguir mostrando anchor_idx
-        # => barras_desde_izq = anchor_px / bar_w_new
-        # => new_offset = anchor_idx - barras_desde_izq
         $self->{visible_bars} = $new;
         $self->{offset} = $anchor_idx - int( $anchor_px / $bar_w_new );
-    }
-    else {
-        # Sin CTRL: anclar la ultima vela visible (borde derecho)
+    } else {
         my $anchor = $self->{offset} + $old - 1;
         $self->{visible_bars} = $new;
         $self->{offset}       = $anchor - ( $new - 1 );
@@ -710,7 +723,7 @@ sub _clamp_atr_range {
     my @valid   = grep { defined $_ } @$vis_atr;
     return ( $new_mn, $new_mx ) unless @valid;
 
-    my $data_max = $valid[0];
+    my $data_max   = $valid[0];
     for my $v (@valid) { $data_max = $v if $v > $data_max; }
     my $data_range = $data_max < 0.1 ? 0.1 : $data_max;
     my $margin     = $data_range * 0.5;
@@ -881,8 +894,7 @@ sub _vertical_zoom_price {
     my ( $mn, $mx );
     if ( $self->{y_range_price} ) {
         ( $mn, $mx ) = @{ $self->{y_range_price} };
-    }
-    else {
+    } else {
         my ( $s, $e ) = $self->compute_window;
         ( $mn, $mx ) = $self->{price_panel}->get_y_range( $self->{market}->get_slice($s,$e) );
     }
@@ -899,8 +911,7 @@ sub _vertical_zoom_atr {
     my ( $mn, $mx );
     if ( $self->{y_range_atr} ) {
         ( $mn, $mx ) = @{ $self->{y_range_atr} };
-    }
-    else {
+    } else {
         my ( $s, $e ) = $self->compute_window;
         ( $mn, $mx ) = $self->{atr_panel}->get_y_range(
             $self->{indicators}->slice_array( 'atr', $s, $e ) );
@@ -914,18 +925,14 @@ sub _vertical_zoom_atr {
 
 # -----------------------------------------------------------------------------
 # _draw_crosshair_all
-# Cuando CTRL esta activo: usar anchor_px como X fija del crosshair.
 # -----------------------------------------------------------------------------
 sub _draw_crosshair_all {
     my ($self) = @_;
 
-    # X del crosshair: si CTRL activo usar anchor_px, si no usar _mouse_x
     my $x;
     if ( $self->{_ctrl_pressed} && defined $self->{_zoom_anchor_px} ) {
-        # Usar el pixel fisico congelado — nunca recalcular
         $x = $self->{_zoom_anchor_px};
-    }
-    else {
+    } else {
         $x = $self->{_mouse_x};
     }
 
@@ -944,14 +951,12 @@ sub _draw_crosshair_all {
             my $snap_idx = $self->{_scale_price}->x_to_index($x);
             my $snap_x   = $self->{_scale_price}->index_to_center_x($snap_idx);
             $self->{price_panel}->draw_crosshair( $snap_x, $y, $candle_info );
-        }
-        elsif ( $self->{_mouse_in_atr} ) {
+        } elsif ( $self->{_mouse_in_atr} ) {
             my $snap_idx = $self->{_scale_price}->x_to_index($x);
             my $snap_x   = $self->{_scale_price}->index_to_center_x($snap_idx);
             $self->{price_panel}->show_vline_only($snap_x);
             $self->{price_panel}->show_ohlcv_info($candle_info) if $candle_info;
-        }
-        else {
+        } else {
             $self->{price_panel}->hide_crosshair;
         }
     }
@@ -961,13 +966,11 @@ sub _draw_crosshair_all {
             my $snap_idx = $self->{_scale_atr}->x_to_index($x);
             my $snap_x   = $self->{_scale_atr}->index_to_center_x($snap_idx);
             $self->{atr_panel}->draw_crosshair( $snap_x, $y_atr );
-        }
-        elsif ( $self->{_mouse_in_price} || $self->{_ctrl_pressed} ) {
+        } elsif ( $self->{_mouse_in_price} || $self->{_ctrl_pressed} ) {
             my $snap_idx = $self->{_scale_atr}->x_to_index($x);
             my $snap_x   = $self->{_scale_atr}->index_to_center_x($snap_idx);
             $self->{atr_panel}->show_vline_only($snap_x);
-        }
-        else {
+        } else {
             $self->{atr_panel}->hide_crosshair;
         }
     }
@@ -1059,8 +1062,7 @@ sub compute_intraday_labels {
         if ($day_change) {
             my $wday = ( gmtime( $c->{ts} ) )[6];
             $label = $DAY_ABBR[$wday] . ' ' . $mday;
-        }
-        else {
+        } else {
             $label = sprintf( '%d:%02d',
                 int( $cur_slot * $step_min / 60 ),
                 ( $cur_slot * $step_min ) % 60 );

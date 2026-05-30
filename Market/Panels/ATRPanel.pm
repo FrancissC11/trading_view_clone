@@ -20,9 +20,10 @@ use warnings;
 # ------------------------------------------------------------------------------
 
 use constant {
-    COLOR_ATR   => '#b71c1c',
-    COLOR_CROSS => '#9598a1',
-    BG_COLOR    => '#ffffff',
+    COLOR_ATR      => '#ff2121',   # color de la linea del ATR
+    COLOR_ATR_LAST => '#c65300',   # color de la caja del ultimo valor
+    COLOR_CROSS    => '#9598a1',
+    BG_COLOR       => '#ffffff',
 };
 
 # ------------------------------------------------------------------------------
@@ -195,9 +196,9 @@ sub render_last_visible_value {
     my $x_end = $scale->{canvas_w};
 
     $canvas->createLine(0, $y, $x_sep, $y,
-        -fill => COLOR_ATR, -dash => [3,3], -width => 1, -tags => ['atr_all']);
+        -fill => COLOR_ATR_LAST, -dash => [3,3], -width => 1, -tags => ['atr_all']);
     $canvas->createRectangle($x_sep+1, $y-9, $x_end-1, $y+9,
-        -fill => COLOR_ATR, -outline => COLOR_ATR, -tags => ['atr_all']);
+        -fill => COLOR_ATR_LAST, -outline => COLOR_ATR_LAST, -tags => ['atr_all']);
     $canvas->createText($x_sep + ($x_end-$x_sep)/2, $y,
         -text   => sprintf('%.4f', $last_val),
         -fill   => '#ffffff',
