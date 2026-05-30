@@ -24,7 +24,7 @@ use constant {
     COLOR_CROSS    => '#9598a1',
     COLOR_FG       => '#363a45',
     COLOR_GRID     => '#e0e3eb',
-    COLOR_LAST_BG  => '#2962ff',    # azul TradingView para ultimo precio
+    COLOR_LAST_BG  => '#69ea07',    # azul TradingView para ultimo precio
     COLOR_INFO     => '#363a45',
     BG_COLOR       => '#ffffff',
     MIN_BODY_H     => 1,
