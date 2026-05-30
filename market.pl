@@ -256,7 +256,34 @@ $tf_frame->Button(%bs, -text => '-',
 $tf_frame->Frame(-background => '#c9cdd7', -width => 1, -height => 16)
     ->pack(-side => 'left', -pady => 5, -padx => 6);
 
+# Boton modo Auto / Manual
+my $mode_btn;
+$mode_btn = $tf_frame->Button(%bs,
+    -text       => 'Auto',
+    -foreground => '#26a69a',
+    -font       => 'TkDefaultFont 9 bold',
+    -command    => sub {
+        my $is_free = $engine->toggle_free_mode;
+        if ($is_free) {
+            $mode_btn->configure(
+                -text       => 'Manual',
+                -foreground => '#ef5350',
+            );
+        } else {
+            $mode_btn->configure(
+                -text       => 'Auto',
+                -foreground => '#26a69a',
+            );
+        }
+    },
+)->pack(-side => 'left', -padx => 4, -pady => 2);
+
+$tf_frame->Frame(-background => '#c9cdd7', -width => 1, -height => 16)
+    ->pack(-side => 'left', -pady => 5, -padx => 6);
+
 my $active_tf = '1m';
+
+
 my $tf_lbl = $tf_frame->Label(%bs,
     -text       => '1m',
     -foreground => '#2962ff',
