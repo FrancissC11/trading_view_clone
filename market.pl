@@ -250,6 +250,16 @@ for my $tf (qw(1m 5m 15m)) {
                 );
             }
             $engine->set_timeframe($tf);
+
+            # Resetear botones de modo a Auto
+            $mode_btn->configure(
+                -text       => 'P:Auto',
+                -foreground => '#26a69a',
+            );
+            $mode_btn_atr->configure(
+                -text       => 'ATR:Auto',
+                -foreground => '#26a69a',
+            );
         },
     )->pack(-side => 'left', -padx => 1, -pady => 2);
     $tf_btns{$tf} = $btn;

@@ -1186,6 +1186,15 @@ sub set_timeframe {
     $self->{market}->set_timeframe($tf);
     $self->{indicators}->reset_all;
     $self->{indicators}->rebuild_all( $self->{market} );
+
+    # Resetear modos manuales al cambiar temporalidad
+    $self->{_free_mode_price} = 0;
+    $self->{_free_mode_atr}   = 0;
+    $self->{zoom_y_auto}      = 1;
+    $self->{y_range_price}    = undef;
+    $self->{zoom_y_auto_atr}  = 1;
+    $self->{y_range_atr}      = undef;
+
     $self->reset_view;
     $self->request_render;
 }
