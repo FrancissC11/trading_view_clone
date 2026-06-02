@@ -6,7 +6,7 @@ use POSIX qw(floor);
 use Market::Panels::Scales;
 
 use constant {
-    MIN_BARS       => 2,        # Límite modificado para mostrar mínimo 2 velas
+    MIN_BARS       => 2,
     MAX_BARS       => 800,
     DEFAULT_BARS   => 120,
     PRICE_SCALE_W  => 90,
@@ -819,11 +819,22 @@ sub bind_events {
 
 # -----------------------------------------------------------------------------
 # _horizontal_zoom
+# FIX: Agregada validacion para romper el bucle infinito cuando el redondeo
+# de enteros atasca el factor de escala al llegar a MIN_BARS o al alejar.
 # -----------------------------------------------------------------------------
 sub _horizontal_zoom {
     my ( $self, $dir, $use_anchor ) = @_;
     my $old = $self->{visible_bars};
-    my $new = ( $dir > 0 ) ? int( $old * 1.15 ) : int( $old / 1.15 );
+    
+    my $new;
+    if ( $dir > 0 ) {
+        $new = int( $old * 1.15 );
+        $new++ if $new == $old; # Fuerza el salto si el redondeo lo estanca
+    } else {
+        $new = int( $old / 1.15 );
+        $new-- if $new == $old; # Fuerza el salto si el redondeo lo estanca
+    }
+
     $new = MIN_BARS if $new < MIN_BARS;
     $new = MAX_BARS if $new > MAX_BARS;
     return if $new == $old;
@@ -1052,7 +1063,6 @@ sub _draw_crosshair_all {
             my $snap_x   = $self->{_scale_price}->index_to_center_x($snap_idx);
             $self->{price_panel}->show_vline_only($snap_x);
             
-            # --- MODIFICACION: Dibuja la fecha inferior cuando el mouse esta en el ATR ---
             if ($candle_info) {
                 $self->{price_panel}->show_ohlcv_info($candle_info);
                 $self->{price_panel}->draw_time_label($snap_x, $candle_info);
