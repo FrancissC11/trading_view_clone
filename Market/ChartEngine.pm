@@ -6,7 +6,7 @@ use POSIX qw(floor);
 use Market::Panels::Scales;
 
 use constant {
-    MIN_BARS       => 10,
+    MIN_BARS       => 2,        # Límite modificado para mostrar mínimo 2 velas
     MAX_BARS       => 800,
     DEFAULT_BARS   => 120,
     PRICE_SCALE_W  => 90,
