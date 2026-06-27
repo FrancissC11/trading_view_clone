@@ -7,12 +7,23 @@ package Market::Overlays::Liquidity;
 # Indicators/Liquidity.pm (swings, niveles BSL/SSL, EQH/EQL y eventos
 # Sweep/Grab/Run) y lo dibuja segun la Tabla 2 del PDF. NO calcula nada.
 #
-# Contrato de Overlay (OverlayManager): tag() + render($canvas, $scale).
-# Sub-toggles independientes: show_swing / show_bsl / show_ssl / show_eqh /
-#   show_eql / show_sweeps / show_grabs / show_runs
+# Estilo de etiquetas: igual que el proyecto de referencia (helper _chip):
+#   - outline : texto de color sobre chip blanco con borde de color ->
+#               niveles resting BSL/SSL y EQH/EQL (sobrios, junto al evento).
+#   - solid   : texto blanco sobre chip de color -> eventos resueltos
+#               Sweep / Grab / Run (destacados).
+#   Anti-solape que DESPLAZA la etiqueta verticalmente (no la borra). Las
+#   etiquetas se anclan a la coordenada X/precio reales -> estables en
+#   replay/zoom/desplazamiento.
 #
-# Las etiquetas son "tags" compactos centrados (texto blanco sobre color) con
-# anti-solapamiento, para que la grafica no se sature.
+#   BSL/SSL : linea horizontal punteada (rojo/verde) que se extiende a la
+#             derecha; chip "BSL"/"SSL" junto a la regleta.
+#   EQH/EQL : linea que conecta los dos pivotes iguales + chip.
+#   Sweep/Grab/Run : marcador en la vela de resolucion + chip de color.
+#
+# Contrato de Overlay (OverlayManager): tag() + render($canvas, $scale).
+# Sub-toggles: show_swing/show_bsl/show_ssl/show_eqh/show_eql/show_sweeps/
+#   show_grabs/show_runs.
 # =============================================================================
 
 use strict;
@@ -21,13 +32,13 @@ use warnings;
 use constant TAG => 'overlay_liquidity';
 
 use constant {
-    C_BSL   => '#ef5350',   # rojo
-    C_SSL   => '#26a69a',   # verde
-    C_EQ    => '#8e24aa',   # morado (configurable)
-    C_GRAB  => '#ff9800',   # naranja
-    C_RUN   => '#2962ff',   # azul
-    MAX_LINES => 6,         # niveles BSL/SSL resting dibujados (los mas recientes)
-    MAX_EVENTS => 60,       # eventos recientes considerados por render
+    C_BSL    => '#ef5350',   # rojo    (Buy Side Liquidity)
+    C_SSL    => '#26a69a',   # verde   (Sell Side Liquidity)
+    C_EQ     => '#7e57c2',   # violeta (EQH/EQL, configurable)
+    C_GRAB   => '#ff9800',   # naranja (Liquidity Grab)
+    C_RUN    => '#2962ff',   # azul    (Liquidity Run)
+    MAX_LINES  => 6,         # niveles BSL/SSL resting dibujados (mas recientes)
+    MAX_EVENTS => 50,        # eventos recientes considerados por render
 };
 
 sub new {
@@ -60,7 +71,7 @@ sub render {
     my $src = $self->{source};
     return unless $src;
 
-    my @placed;   # cajas de etiquetas (anti-solape, compartido en el frame)
+    my @placed;   # cajas [x1,y1,x2,y2] de etiquetas ya colocadas (anti-solape)
     $self->_render_swings( $canvas, $scale, $src )            if $self->{show_swing};
     $self->_render_levels( $canvas, $scale, $src, \@placed );
     $self->_render_equals( $canvas, $scale, $src, \@placed )
@@ -69,9 +80,8 @@ sub render {
 }
 
 # -----------------------------------------------------------------------------
-# Niveles BSL/SSL "resting" (aun no barridos): linea horizontal discontinua;
-# la etiqueta se ancla cerca de la regleta de precio (columna ordenada) con
-# anti-solape vertical.
+# Niveles BSL/SSL "resting" (aun no barridos): linea horizontal punteada que se
+# extiende a la derecha; chip outline "BSL"/"SSL" junto a la regleta de precio.
 # -----------------------------------------------------------------------------
 sub _render_levels {
     my ( $self, $canvas, $scale, $src, $placed ) = @_;
@@ -101,18 +111,22 @@ sub _render_levels {
             my $y  = $scale->value_to_y( $lv->{price} );
             my $x1 = $scale->index_to_center_x( $lv->{index} );
             $x1 = 0 if $x1 < 0;
+            next if $x1 >= $plot_w;
 
             $canvas->createLine(
                 $x1, $y, $plot_w, $y,
-                -fill => $color, -dash => [ 5, 4 ], -width => 1, -tags => [TAG] );
+                -fill => $color, -dash => [ 2, 3 ], -width => 1, -tags => [TAG] );
 
-            _tag( $canvas, $plot_w - 16, $y, $text, $color, $placed );
+            $self->_chip( $canvas, $plot_w - 20, $y, $text,
+                -color => $color, -style => 'outline', -place => 'center',
+                -placed => $placed );
         }
     }
 }
 
 # -----------------------------------------------------------------------------
-# Swing Points: marcador triangular pequeño (sin texto, no satura).
+# Swing Points: marcador triangular pequeno y sobrio (sin texto, no satura).
+# Rojo en swing high, verde en swing low (relacion de color por tipo).
 # -----------------------------------------------------------------------------
 sub _render_swings {
     my ( $self, $canvas, $scale, $src ) = @_;
@@ -125,21 +139,21 @@ sub _render_swings {
         next if $sw->{index} < $off || $sw->{index} > $off + $vb;
         next unless $scale->value_in_range( $sw->{price} );
 
-        my $x = $scale->index_to_center_x( $sw->{index} );
-        my $y = $scale->value_to_y( $sw->{price} );
+        my $x  = $scale->index_to_center_x( $sw->{index} );
         my $up = ( $sw->{kind} eq 'H' );
+        my $y  = $scale->value_to_y( $sw->{price} );
         my $color = $up ? C_BSL : C_SSL;
-        my $dy = $up ? -6 : 6;
+        my $dy = $up ? -7 : 7;
 
-        $canvas->createLine( $x - 4, $y + $dy, $x, $y,
+        $canvas->createLine( $x - 3, $y + $dy, $x, $y,
             -fill => $color, -width => 1, -tags => [TAG] );
-        $canvas->createLine( $x + 4, $y + $dy, $x, $y,
+        $canvas->createLine( $x + 3, $y + $dy, $x, $y,
             -fill => $color, -width => 1, -tags => [TAG] );
     }
 }
 
 # -----------------------------------------------------------------------------
-# EQH / EQL: linea que conecta ambos pivotes iguales + etiqueta compacta.
+# EQH / EQL: linea punteada que conecta ambos pivotes iguales + chip outline.
 # -----------------------------------------------------------------------------
 sub _render_equals {
     my ( $self, $canvas, $scale, $src, $placed ) = @_;
@@ -163,16 +177,17 @@ sub _render_equals {
         my $y2 = $scale->value_to_y( $e->{p2} );
 
         $canvas->createLine( $x1, $y1, $x2, $y2,
-            -fill => C_EQ, -width => 1, -dash => [ 2, 2 ], -tags => [TAG] );
+            -fill => C_EQ, -width => 1, -dash => [ 4, 2 ], -tags => [TAG] );
 
-        _tag( $canvas, ( $x1 + $x2 ) / 2, ( $y1 + $y2 ) / 2 - 9,
-            $e->{kind}, C_EQ, $placed );
+        $self->_chip( $canvas, ( $x1 + $x2 ) / 2, ( $y1 + $y2 ) / 2, $e->{kind},
+            -color => C_EQ, -style => 'outline',
+            -place => ( $is_high ? 'above' : 'below' ), -placed => $placed );
     }
 }
 
 # -----------------------------------------------------------------------------
-# Eventos Sweep / Grab / Run: marca + etiqueta compacta centrada en la vela
-# de resolucion (anti-solape, prioriza los mas recientes).
+# Eventos Sweep / Grab / Run: marcador en la vela de resolucion + chip solido
+# (anti-solape, prioriza los mas recientes).
 # -----------------------------------------------------------------------------
 sub _render_events {
     my ( $self, $canvas, $scale, $src, $placed ) = @_;
@@ -201,46 +216,79 @@ sub _render_events {
           : ( $t eq 'RUN' )  ? C_RUN
           : ( $ev->{dir} eq 'up' ) ? C_BSL : C_SSL;
 
+        my $up = ( $ev->{dir} eq 'up' );
+        my $dy = $up ? -10 : 10;
+
+        $canvas->createLine( $x, $y, $x, $y + $dy,
+            -fill => $color, -width => 2, -tags => [TAG] );
         $canvas->createOval( $x - 3, $y - 3, $x + 3, $y + 3,
             -fill => $color, -outline => $color, -tags => [TAG] );
 
-        my $dy = ( $ev->{dir} eq 'up' ) ? -12 : 12;
-        _tag( $canvas, $x, $y + $dy, $ev->{label}, $color, $placed );
+        $self->_chip( $canvas, $x, $y + $dy, $ev->{label},
+            -color => $color, -style => 'solid',
+            -place => ( $up ? 'above' : 'below' ), -placed => $placed );
     }
 }
 
 # -----------------------------------------------------------------------------
-# _tag: etiqueta compacta centrada (texto blanco sobre color) anti-solape.
+# _chip: etiqueta tipo TradingView (replica del proyecto de referencia).
+#   -style 'solid'  : texto blanco sobre chip de color (eventos).
+#   -style 'outline': texto de color sobre chip blanco con borde de color.
+#   -place 'above'|'below'|'center' respecto a (cx,cy); -offset separacion.
+#   Anti-solape: si choca con una etiqueta ya puesta, la DESPLAZA (no la borra).
+#   $placed acumula las cajas [x1,y1,x2,y2] del frame actual.
 # -----------------------------------------------------------------------------
-sub _tag {
-    my ( $canvas, $x, $y, $text, $color, $placed ) = @_;
+sub _chip {
+    my ( $self, $canvas, $cx, $cy, $text, %o ) = @_;
+    my $color  = $o{-color} // '#363a45';
+    my $style  = $o{-style} // 'solid';
+    my $place  = $o{-place} // 'above';
+    my $off    = defined $o{-offset} ? $o{-offset} : 9;
+    my $font   = $o{-font}
+              // ( $style eq 'solid' ? 'TkDefaultFont 12 bold' : 'TkDefaultFont 7 bold' );
+    my $placed = $o{-placed};
+    my $pad    = 2;
 
-    # Texto primero -> bbox real -> fondo ajustado -> texto al frente. Asi la
-    # etiqueta queda exactamente centrada y del tamaño del texto.
-    my $t = $canvas->createText(
-        $x, $y, -text => $text, -fill => '#ffffff',
-        -anchor => 'center', -font => 'TkDefaultFont 8 bold', -tags => [TAG] );
-    my @bb = $canvas->bbox($t);
-    return 0 unless @bb;
+    my $ty = $place eq 'below'  ? $cy + $off
+           : $place eq 'center' ? $cy
+           :                      $cy - $off;
+
+    my $tid = $canvas->createText(
+        $cx, $ty, -text => $text, -anchor => 'center', -font => $font,
+        -fill => ( $style eq 'solid' ? '#ffffff' : $color ), -tags => [TAG] );
+    my @bb = $canvas->bbox($tid);
+    return unless @bb;
     my ( $x1, $y1, $x2, $y2 ) = @bb;
-    my $w = $x2 - $x1;
-    my $h = $y2 - $y1;
+    $x1 -= $pad; $x2 += $pad; $y1 -= 1; $y2 += 1;
 
-    for my $p (@$placed) {
-        if (   abs( $p->[0] - $x ) < ( $w + $p->[2] ) / 2
-            && abs( $p->[1] - $y ) < ( $h + $p->[3] ) / 2 )
-        {
-            $canvas->delete($t);
-            return 0;
+    if ($placed) {
+        my $dir   = $place eq 'below' ? 1 : -1;
+        my $h     = ( $y2 - $y1 ) + 2;
+        my $tries = 0;
+        while ( $tries++ < 6 && _box_hits( [ $x1, $y1, $x2, $y2 ], $placed ) ) {
+            my $shift = $dir * $h;
+            $_ += $shift for ( $y1, $y2 );
+            $canvas->move( $tid, 0, $shift );
         }
+        push @$placed, [ $x1, $y1, $x2, $y2 ];
     }
-    push @$placed, [ $x, $y, $w, $h ];
 
-    my $r = $canvas->createRectangle(
-        $x1 - 3, $y1 - 2, $x2 + 3, $y2 + 2,
-        -fill => $color, -outline => $color, -tags => [TAG] );
-    $canvas->raise( $t, $r );
-    return 1;
+    my $fill = $style eq 'solid' ? $color : '#ffffff';
+    my $rid  = $canvas->createRectangle(
+        $x1, $y1, $x2, $y2,
+        -fill => $fill, -outline => $color, -width => 1, -tags => [TAG] );
+    $canvas->lower( $rid, $tid );
+    return [ $x1, $y1, $x2, $y2 ];
+}
+
+sub _box_hits {
+    my ( $b, $list ) = @_;
+    for my $o (@$list) {
+        next if $b->[2] < $o->[0] || $b->[0] > $o->[2]
+             || $b->[3] < $o->[1] || $b->[1] > $o->[3];
+        return 1;
+    }
+    return 0;
 }
 
 1;

@@ -72,18 +72,6 @@ sub new {
         # Flag para ignorar <Configure> durante resize manual del separador
         _resizing_panels => 0,
 
-        # ---------------------------------------------------------------------
-        # Estado de Replay (Fase 2). El control vive aqui (no hay clase
-        # Replay.pm: la Tabla 1 del PDF no la contempla); la frontera real de
-        # datos vive en MarketData (replay_ts) y es transparente al render.
-        # ---------------------------------------------------------------------
-        _replay_active  => 0,
-        _replay_index   => undef,   # indice (tf activo) del borde de datos conocido
-        _replay_playing => 0,
-        _replay_timer   => undef,
-        _replay_ms      => 350,     # intervalo de Play
-        _cb_replay      => undef,   # callback de estado para la UI
-
         # Drag de la regleta de precios anclado en pasos de 0.25 (tick real)
         _scale_drag_base_mn => undef,
         _scale_drag_base_mx => undef,
@@ -1173,13 +1161,6 @@ sub set_timeframe {
     $self->{indicators}->reset_all;
     $self->{indicators}->rebuild_all( $self->{market} );
 
-    # En replay, la frontera es un timestamp (independiente del TF). Tras el
-    # cambio de TF, market->last_index ya devuelve el ultimo indice valido del
-    # nuevo TF acotado por esa frontera: re-anclamos el puntero de replay ahi.
-    if ( $self->{_replay_active} ) {
-        $self->{_replay_index} = $self->{market}->last_index;
-    }
-
     $self->{_free_mode_price} = 0;
     $self->{_free_mode_atr}   = 0;
     $self->{zoom_y_auto}      = 1;
@@ -1211,173 +1192,23 @@ sub reset_view {
     $self->{offset} = 0 if $self->{offset} < 0;
 }
 
-# =============================================================================
-# SISTEMA REPLAY
-# La frontera real de datos vive en MarketData (replay_ts, transparente al
-# render). Aqui solo se orquesta el puntero, el timer de Play y el recalculo
-# de indicadores. En cada paso, market->size se acota sola: el render y CUALQUIER
-# indicador/overlay "ven menos" automaticamente -> imposible filtrar futuro.
-# =============================================================================
-sub set_replay_callback {
-    my ( $self, $cb ) = @_;
-    $self->{_cb_replay} = $cb;
-}
-
-sub is_replay_active { return $_[0]->{_replay_active}; }
-
-sub _notify_replay {
-    my ($self) = @_;
-    return unless $self->{_cb_replay};
-    my $status = 'inactivo';
-    if ( $self->{_replay_active} ) {
-        my $c = $self->{market}->get_candle( $self->{market}->last_index );
-        my $tlabel = $c && $c->{time} ? _format_time_for_axis( $c->{time} ) : '';
-        $status = ( $self->{_replay_playing} ? 'Play' : 'Pausa' )
-                . ( $tlabel ne '' ? "  $tlabel" : '' );
-    }
-    $self->{_cb_replay}->( $self->{_replay_active}, $self->{_replay_playing}, $status );
-}
-
 # -----------------------------------------------------------------------------
-# replay_start / replay_exit
+# follow_replay_pointer (Etapa 3, Fase 2)
+# Reposiciona la ventana visible para que la ultima vela del puntero de
+# Replay quede a la vista, SIN tocar visible_bars ni el estado de zoom
+# vertical -- a diferencia de reset_view, que reinicia todo. Se llama
+# desde el callback on_change de Market::Replay cada vez que el puntero
+# avanza/retrocede/arranca/sale, para que el usuario nunca pierda de
+# vista la vela que el replay esta mostrando, conservando el zoom que
+# tenia elegido.
 # -----------------------------------------------------------------------------
-sub replay_start {
+sub follow_replay_pointer {
     my ($self) = @_;
-    return if $self->{_replay_active};
+    my $total = $self->{market}->size;
+    return if $total <= 0;
 
-    my $full_last = $self->{market}->full_last_index;
-    return if $full_last < 1;
-
-    # Punto de arranque: borde derecho visible actual. Si ya estamos al final
-    # del dataset, retrocedemos media ventana para que haya "futuro" que
-    # revelar al avanzar el replay.
-    my $right = floor( $self->{offset} ) + $self->{visible_bars} - 1;
-    $right = $full_last if $right > $full_last;
-    $right = $full_last - int( $self->{visible_bars} / 2 ) if $right >= $full_last;
-    $right = 0 if $right < 0;
-
-    $self->{_replay_active}  = 1;
-    $self->{_replay_playing} = 0;
-    $self->{_replay_index}   = $right;
-    $self->{market}->set_replay_ts( $self->{market}->full_ts_at($right) );
-
-    $self->_replay_rebuild;
-    $self->reset_view;            # reposiciona la vista al borde acotado
+    $self->{offset} = $total - $self->{visible_bars};
     $self->request_render;
-    $self->_notify_replay;
-}
-
-sub replay_exit {
-    my ($self) = @_;
-    return unless $self->{_replay_active};
-    $self->_replay_cancel_timer;
-    $self->{_replay_active}  = 0;
-    $self->{_replay_playing} = 0;
-    $self->{_replay_index}   = undef;
-    $self->{market}->clear_replay;
-    $self->_replay_rebuild;       # rebuild completo sobre el dataset entero
-    $self->reset_view;
-    $self->request_render;
-    $self->_notify_replay;
-}
-
-# -----------------------------------------------------------------------------
-# replay_step($dir): +1 avanza una vela, -1 retrocede una vela.
-# Recalculo: avance simple = incremental (update_last); retroceso = rebuild
-# completo (la maquina de estados de liquidez no es reversible limpiamente).
-# -----------------------------------------------------------------------------
-sub replay_step {
-    my ( $self, $dir ) = @_;
-    return unless $self->{_replay_active};
-
-    my $full_last = $self->{market}->full_last_index;
-    my $old_size  = $self->{market}->size;
-    my $new_idx   = $self->{_replay_index} + $dir;
-    $new_idx = 0         if $new_idx < 0;
-    $new_idx = $full_last if $new_idx > $full_last;
-    return if $new_idx == $self->{_replay_index};
-
-    my $was_at_edge = ( floor( $self->{offset} ) + $self->{visible_bars} - 1 )
-                       >= ( $old_size - 1 );
-
-    $self->{_replay_index} = $new_idx;
-    $self->{market}->set_replay_ts( $self->{market}->full_ts_at($new_idx) );
-
-    if ( $dir == 1 ) {
-        $self->{indicators}->update_last( $self->{market} );   # incremental
-    } else {
-        $self->_replay_rebuild;                                # rebuild
-    }
-
-    # Si seguiamos el borde en vivo, mantener la ultima vela visible.
-    if ( $was_at_edge ) {
-        $self->{offset} = $self->{market}->size - $self->{visible_bars};
-    }
-
-    $self->request_render;
-    $self->_notify_replay;
-    return $new_idx;
-}
-
-# -----------------------------------------------------------------------------
-# replay_play / replay_fast_forward
-# -----------------------------------------------------------------------------
-sub replay_play {
-    my ($self) = @_;
-    $self->replay_start unless $self->{_replay_active};
-
-    if ( $self->{_replay_playing} ) {
-        $self->{_replay_playing} = 0;
-        $self->_replay_cancel_timer;
-    } else {
-        $self->{_replay_playing} = 1;
-        $self->_replay_schedule;
-    }
-    $self->_notify_replay;
-}
-
-sub replay_fast_forward {
-    my ($self) = @_;
-    $self->replay_start unless $self->{_replay_active};
-    # Salto controlado de varias velas hacia adelante (revela datos mas rapido
-    # que Play, sin filtrar futuro: cada paso recorta la frontera igual).
-    $self->replay_step(1) for 1 .. 10;
-}
-
-sub _replay_schedule {
-    my ($self) = @_;
-    $self->_replay_cancel_timer;
-    return unless $self->{_replay_playing};
-    $self->{_replay_timer} = $self->{canvas_price}->after(
-        $self->{_replay_ms}, sub { $self->_replay_tick } );
-}
-
-sub _replay_tick {
-    my ($self) = @_;
-    return unless $self->{_replay_playing};
-    my $idx  = $self->replay_step(1);
-    my $last = $self->{market}->full_last_index;
-    if ( !defined $idx || $idx >= $last ) {
-        $self->{_replay_playing} = 0;
-        $self->_notify_replay;
-        return;
-    }
-    $self->_replay_schedule;
-}
-
-sub _replay_cancel_timer {
-    my ($self) = @_;
-    if ( $self->{_replay_timer} ) {
-        eval { $self->{_replay_timer}->cancel };
-        $self->{_replay_timer} = undef;
-    }
-}
-
-# Rebuild completo de indicadores hasta la frontera vigente.
-sub _replay_rebuild {
-    my ($self) = @_;
-    $self->{indicators}->reset_all;
-    $self->{indicators}->rebuild_all( $self->{market} );
 }
 
 sub compute_intraday_labels {

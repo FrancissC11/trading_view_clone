@@ -180,7 +180,7 @@ sub _detect_bos_choch {
     if ( $mh && $mh->{index} != $self->{_bh_idx} && $cur->{close} > $mh->{price} ) {
         my $type = ( defined $self->{_bias} && $self->{_bias} eq 'bear' )
             ? 'CHoCH' : 'BOS';
-        $self->_emit( $type, 'up', $i, $mh->{price} );
+        $self->_emit( $type, 'up', $i, $mh->{price}, $mh->{index} );
         $self->{_bias}   = 'bull';
         $self->{_bh_idx} = $mh->{index};
     }
@@ -189,18 +189,19 @@ sub _detect_bos_choch {
     if ( $ml && $ml->{index} != $self->{_bl_idx} && $cur->{close} < $ml->{price} ) {
         my $type = ( defined $self->{_bias} && $self->{_bias} eq 'bull' )
             ? 'CHoCH' : 'BOS';
-        $self->_emit( $type, 'down', $i, $ml->{price} );
+        $self->_emit( $type, 'down', $i, $ml->{price}, $ml->{index} );
         $self->{_bias}   = 'bear';
         $self->{_bl_idx} = $ml->{index};
     }
 }
 
 sub _emit {
-    my ( $self, $type, $dir, $i, $price ) = @_;
+    my ( $self, $type, $dir, $i, $price, $origin ) = @_;
     push @{ $self->{_events} }, {
         type      => $type,        # BOS | CHoCH
         dir       => $dir,         # up | down
-        index     => $i,
+        index     => $i,           # vela de ruptura (cierre mas alla del nivel)
+        origin    => $origin,      # indice del swing roto (inicio de la linea)
         ts        => $self->{_c}[$i]{ts},
         price     => $price,
         label     => $type,

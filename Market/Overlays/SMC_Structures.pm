@@ -3,23 +3,38 @@ package Market::Overlays::SMC_Structures;
 # =============================================================================
 # Market::Overlays::SMC_Structures   (Tabla 1 del PDF)
 #
-# Renderizado en el Canvas de las estructuras SMC ya calculadas por
+# Capa visual de las estructuras SMC ya calculadas por
 # Indicators/SMC_Structures.pm: zonas FVG con desvanecimiento progresivo y
-# etiquetas BOS / CHoCH ubicadas en el tiempo. NO calcula nada.
+# lineas BOS / CHoCH con etiquetas ubicadas en el tiempo. NO calcula nada.
+#
+# Estilo de etiquetas: igual que el indicador "SMC Structures and FVG" de
+# referencia (helper _chip):
+#   - solid   : texto blanco sobre chip de color   -> eventos (BOS / CHoCH).
+#   - outline : texto de color sobre chip blanco    -> etiqueta de la zona FVG.
+#   El chip se ancla a la coordenada X/precio reales (index_to_center_x /
+#   value_to_y), con anti-solape que DESPLAZA la etiqueta verticalmente (no la
+#   borra), redibujado cada frame -> estable en replay/zoom/desplazamiento.
+#
+#   BOS   : linea horizontal SOLIDA en el nivel roto, color direccional
+#           (verde alcista / rojo bajista), chip centrado sobre la linea.
+#   CHoCH : linea PUNTEADA violeta, chip centrado.
+#   FVG   : caja semitransparente que se desvanece con la edad (interpolacion
+#           de color hacia el fondo).
 #
 # Contrato de Overlay (OverlayManager): tag() + render($canvas, $scale).
-# Reutiliza el MISMO objeto Scales del panel de precio.
 # Sub-toggles independientes: show_fvg / show_bos / show_choch.
-#
-# Las etiquetas se dibujan como "tags" compactos centrados (texto blanco sobre
-# fondo de color), con anti-solapamiento para que no se amontonen.
 # =============================================================================
 
 use strict;
 use warnings;
-use POSIX qw(floor);
 
 use constant TAG => 'overlay_smc';
+
+use constant {
+    C_UP    => '#26a69a',   # BOS alcista / FVG alcista (verde)
+    C_DOWN  => '#ef5350',   # BOS bajista / FVG bajista (rojo)
+    C_CHOCH => '#ab47bc',   # CHoCH (violeta)
+};
 
 sub new {
     my ( $class, %args ) = @_;
@@ -43,6 +58,7 @@ sub set_flag {
 
 # -----------------------------------------------------------------------------
 # render: se auto-limpia con su tag y dibuja solo lo visible.
+# El FVG va primero (al fondo); las lineas/chips de BOS/CHoCH encima.
 # -----------------------------------------------------------------------------
 sub render {
     my ( $self, $canvas, $scale ) = @_;
@@ -50,15 +66,15 @@ sub render {
     my $src = $self->{source};
     return unless $src;
 
-    my @placed;   # cajas de etiquetas ya colocadas (anti-solape)
+    my @placed;   # cajas [x1,y1,x2,y2] de etiquetas ya colocadas (anti-solape)
     $self->_render_fvgs( $canvas, $scale, $src, \@placed ) if $self->{show_fvg};
     $self->_render_events( $canvas, $scale, $src, \@placed )
         if $self->{show_bos} || $self->{show_choch};
 }
 
 # -----------------------------------------------------------------------------
-# FVG con desvanecimiento progresivo (interpolacion de color hacia blanco
-# segun la edad en velas). La edad depende de processed_last (replay-aware).
+# FVG: caja semitransparente tenue con desvanecimiento por edad (interpolacion
+# de color hacia el fondo blanco). La edad usa processed_last (replay-aware).
 # -----------------------------------------------------------------------------
 sub _render_fvgs {
     my ( $self, $canvas, $scale, $src, $placed ) = @_;
@@ -88,12 +104,14 @@ sub _render_fvgs {
                  || ( $f->{bottom} < $scale->{min_val}
                    && $f->{top}    > $scale->{max_val} );
 
-        my $opacity = 1 - ( $age / $max_age );
-        $opacity = 0.10 if $opacity < 0.10;
-        $opacity *= 0.5 if $f->{state} eq 'mitigated';
+        my $fresh = 1 - ( $age / $max_age );
+        $fresh = 0 if $fresh < 0;
 
-        my $base = ( $f->{dir} eq 'bull' ) ? '#26a69a' : '#ef5350';
-        my $fill = _fade( $base, $opacity * 0.55 );   # relleno suave
+        my $base    = ( $f->{dir} eq 'bull' ) ? C_UP : C_DOWN;
+        my $fill_op = 0.08 + 0.12 * $fresh;          # 0.08 .. 0.20
+        $fill_op *= 0.55 if $f->{state} eq 'mitigated';
+        my $fill = _mix( $base, $fill_op );
+        my $line = _mix( $base, 0.30 + 0.30 * $fresh );
 
         my $x1 = $scale->index_to_center_x( $f->{idx_start} );
         my $x2 = $scale->index_to_center_x($right_idx);
@@ -107,97 +125,141 @@ sub _render_fvgs {
         $canvas->createRectangle(
             $x1, $yt, $x2, $yb,
             -fill    => $fill,
-            -outline => _fade( $base, $opacity ),
+            -outline => $line,
             -width   => 1,
             -tags    => [TAG],
         );
 
-        # Etiqueta compacta solo en FVG fresco y si hay espacio (anti-solape).
-        if ( $age <= int( $max_age / 3 ) && ( $yb - $yt ) >= 12 ) {
-            _tag( $canvas, $x1 + 16, ( $yt + $yb ) / 2, 'FVG',
-                _fade( $base, 1 ), $placed );
+        # Etiqueta "FVG" (chip outline pequeno) centrada, solo en zonas con
+        # altura util y aun frescas, para no saturar.
+        if ( ( $yb - $yt ) >= 12 && $age <= int( $max_age * 0.5 ) ) {
+            my $tx = ( $x1 + $x2 ) / 2;
+            $tx = 24 if $tx < 24;
+            $self->_chip( $canvas, $tx, ( $yt + $yb ) / 2, 'FVG',
+                -color => $base, -style => 'outline', -place => 'center',
+                -font => 'TkDefaultFont 6 bold', -placed => $placed );
         }
     }
 }
 
 # -----------------------------------------------------------------------------
-# Etiquetas BOS / CHoCH ancladas a la vela exacta del evento, centradas.
+# BOS / CHoCH: linea horizontal en el nivel roto, del pivote de origen a la
+# vela de ruptura, con chip SOLIDO centrado sobre la linea.
 # -----------------------------------------------------------------------------
 sub _render_events {
     my ( $self, $canvas, $scale, $src, $placed ) = @_;
     my $events = $src->get_events or return;
 
-    my $off = $scale->{offset};
-    my $vb  = $scale->{visible_bars};
+    my $off    = $scale->{offset};
+    my $vb     = $scale->{visible_bars};
+    my $plot_w = $scale->_plot_w;
 
-    # De mas reciente a mas antiguo: prioriza etiquetas nuevas si hay solape.
+    # De mas reciente a mas antiguo: si dos chips chocan, gana el mas nuevo.
     for ( my $k = $#$events ; $k >= 0 ; $k-- ) {
         my $e = $events->[$k];
-        next if $e->{type} eq 'BOS'   && !$self->{show_bos};
-        next if $e->{type} eq 'CHoCH' && !$self->{show_choch};
+        my $is_choch = ( $e->{type} eq 'CHoCH' );
+        next if !$is_choch && !$self->{show_bos};
+        next if  $is_choch && !$self->{show_choch};
 
-        next if $e->{index} < $off || $e->{index} > $off + $vb;
+        my $bi = $e->{index};
+        next if $bi < $off || $bi > $off + $vb;
         next unless $scale->value_in_range( $e->{price} );
 
-        my $x = $scale->index_to_center_x( $e->{index} );
-        my $y = $scale->value_to_y( $e->{price} );
-        my $color = ( $e->{type} eq 'BOS' ) ? '#2962ff' : '#ff6d00';
+        my $oi = defined $e->{origin} ? $e->{origin} : $bi - 6;
+        my $x1 = $scale->index_to_center_x($oi);
+        my $x2 = $scale->index_to_center_x($bi);
+        $x1 = 0       if $x1 < 0;
+        $x2 = $plot_w if $x2 > $plot_w;
+        next if $x2 <= $x1;
 
-        # Linea de nivel roto y etiqueta arriba (alcista) / abajo (bajista).
-        $canvas->createLine( $x - 18, $y, $x + 18, $y,
-            -fill => $color, -dash => [ 4, 3 ], -width => 1, -tags => [TAG] );
-        my $dy = ( $e->{dir} eq 'up' ) ? -12 : 12;
-        _tag( $canvas, $x, $y + $dy, $e->{label}, $color, $placed );
+        my $y     = $scale->value_to_y( $e->{price} );
+        my $color = $is_choch ? C_CHOCH : ( $e->{dir} eq 'up' ? C_UP : C_DOWN );
+
+        $canvas->createLine( $x1, $y, $x2, $y,
+            -fill => $color, -width => 1,
+            ( $is_choch ? ( -dash => [ 5, 3 ] ) : () ),
+            -tags => [TAG] );
+
+        my $up = ( ( $e->{dir} || 'up' ) eq 'up' );
+        $self->_chip( $canvas, ( $x1 + $x2 ) / 2, $y, $e->{label},
+            -color => $color, -style => 'solid',
+            -place => ( $up ? 'above' : 'below' ), -placed => $placed );
     }
 }
 
 # -----------------------------------------------------------------------------
-# _tag: etiqueta compacta centrada (texto blanco sobre fondo de color) con
-# anti-solapamiento. $placed acumula [cx,cy,w,h] de las ya dibujadas.
-# Devuelve 1 si la dibujo, 0 si la omitio por solape.
+# _chip: etiqueta tipo TradingView (replica del proyecto de referencia).
+#   -style 'solid'  : texto blanco sobre chip de color (eventos).
+#   -style 'outline': texto de color sobre chip blanco con borde de color.
+#   -place 'above'|'below'|'center' respecto a (cx,cy); -offset separacion.
+#   Anti-solape: si choca con una etiqueta ya puesta, la DESPLAZA (no la borra).
+#   $placed acumula las cajas [x1,y1,x2,y2] del frame actual.
 # -----------------------------------------------------------------------------
-sub _tag {
-    my ( $canvas, $x, $y, $text, $color, $placed ) = @_;
+sub _chip {
+    my ( $self, $canvas, $cx, $cy, $text, %o ) = @_;
+    my $color  = $o{-color} // '#363a45';
+    my $style  = $o{-style} // 'solid';
+    my $place  = $o{-place} // 'above';
+    my $off    = defined $o{-offset} ? $o{-offset} : 9;
+    my $font   = $o{-font}
+              // ( $style eq 'solid' ? 'TkDefaultFont 12 bold' : 'TkDefaultFont 7 bold' );
+    my $placed = $o{-placed};
+    my $pad    = 2;
 
-    # Texto primero -> bbox real -> fondo ajustado -> texto al frente. Asi la
-    # etiqueta queda exactamente centrada y del tamaño del texto.
-    my $t = $canvas->createText(
-        $x, $y, -text => $text, -fill => '#ffffff',
-        -anchor => 'center', -font => 'TkDefaultFont 8 bold', -tags => [TAG] );
-    my @bb = $canvas->bbox($t);
-    return 0 unless @bb;
+    my $ty = $place eq 'below'  ? $cy + $off
+           : $place eq 'center' ? $cy
+           :                      $cy - $off;
+
+    my $tid = $canvas->createText(
+        $cx, $ty, -text => $text, -anchor => 'center', -font => $font,
+        -fill => ( $style eq 'solid' ? '#ffffff' : $color ), -tags => [TAG] );
+    my @bb = $canvas->bbox($tid);
+    return unless @bb;
     my ( $x1, $y1, $x2, $y2 ) = @bb;
-    my $w = $x2 - $x1;
-    my $h = $y2 - $y1;
+    $x1 -= $pad; $x2 += $pad; $y1 -= 1; $y2 += 1;
 
-    for my $p (@$placed) {
-        if (   abs( $p->[0] - $x ) < ( $w + $p->[2] ) / 2
-            && abs( $p->[1] - $y ) < ( $h + $p->[3] ) / 2 )
-        {
-            $canvas->delete($t);
-            return 0;
+    if ($placed) {
+        my $dir   = $place eq 'below' ? 1 : -1;
+        my $h     = ( $y2 - $y1 ) + 2;
+        my $tries = 0;
+        while ( $tries++ < 6 && _box_hits( [ $x1, $y1, $x2, $y2 ], $placed ) ) {
+            my $shift = $dir * $h;
+            $_ += $shift for ( $y1, $y2 );
+            $canvas->move( $tid, 0, $shift );
         }
+        push @$placed, [ $x1, $y1, $x2, $y2 ];
     }
-    push @$placed, [ $x, $y, $w, $h ];
 
-    my $r = $canvas->createRectangle(
-        $x1 - 3, $y1 - 2, $x2 + 3, $y2 + 2,
-        -fill => $color, -outline => $color, -tags => [TAG] );
-    $canvas->raise( $t, $r );
-    return 1;
+    my $fill = $style eq 'solid' ? $color : '#ffffff';
+    my $rid  = $canvas->createRectangle(
+        $x1, $y1, $x2, $y2,
+        -fill => $fill, -outline => $color, -width => 1, -tags => [TAG] );
+    $canvas->lower( $rid, $tid );
+    return [ $x1, $y1, $x2, $y2 ];
+}
+
+sub _box_hits {
+    my ( $b, $list ) = @_;
+    for my $o (@$list) {
+        next if $b->[2] < $o->[0] || $b->[0] > $o->[2]
+             || $b->[3] < $o->[1] || $b->[1] > $o->[3];
+        return 1;
+    }
+    return 0;
 }
 
 # -----------------------------------------------------------------------------
-# _fade: mezcla un color hex con blanco segun opacidad [0..1].
+# _mix: mezcla un color hex con el fondo blanco. $op=1 -> color pleno;
+# $op=0 -> blanco. Simula opacidad (Tk Canvas no tiene canal alfa nativo).
 # -----------------------------------------------------------------------------
-sub _fade {
-    my ( $hex, $opacity ) = @_;
-    $opacity = 0 if $opacity < 0;
-    $opacity = 1 if $opacity > 1;
+sub _mix {
+    my ( $hex, $op ) = @_;
+    $op = 0 if $op < 0;
+    $op = 1 if $op > 1;
     my ( $r, $g, $b ) = ( hex( substr( $hex, 1, 2 ) ),
                           hex( substr( $hex, 3, 2 ) ),
                           hex( substr( $hex, 5, 2 ) ) );
-    my $f = 1 - $opacity;
+    my $f = 1 - $op;
     $r = int( $r + ( 255 - $r ) * $f );
     $g = int( $g + ( 255 - $g ) * $f );
     $b = int( $b + ( 255 - $b ) * $f );
