@@ -1132,11 +1132,20 @@ sub compute_intraday_labels {
     my $visible = $end - $start + 1;
     return [] if $visible <= 0;
 
-    my %tf_min   = ( '1m' => 1, '5m' => 5, '15m' => 15 );
+    my %tf_min   = (
+        '1m' => 1,    '5m' => 5,    '15m' => 15,
+        '1h' => 60,   '2h' => 120,  '4h'  => 240,
+        'D'  => 1440, 'W'  => 10080,
+    );
     my $tf       = $self->{market}->get_timeframe;
     my $bar_min  = $tf_min{$tf} // 1;
 
-    my @nice     = ( 1, 2, 5, 10, 15, 20, 30, 60, 120, 240, 360, 720, 1440 );
+    # FIX (Etapa 1, Fase 2): se extiende la lista de pasos "bonitos" mas
+    # alla de 1440 (1 dia) para que D y W tambien encuentren un paso de
+    # etiquetado razonable en vez de quedarse atascados en el ultimo
+    # valor por defecto.
+    my @nice     = ( 1, 2, 5, 10, 15, 20, 30, 60, 120, 240, 360, 720,
+                      1440, 2880, 5760, 10080, 20160, 43200 );
     my $step_min = $nice[-1];
     for my $s (@nice) {
         next if $s < $bar_min;

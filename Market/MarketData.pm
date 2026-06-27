@@ -4,7 +4,7 @@ package Market::MarketData;
 # Market::MarketData
 # Responsabilidad: almacenar y gestionar datos de mercado OHLCV.
 # Garantiza sincronizacion temporal, acceso eficiente por indice
-# y construccion de temporalidades (1m -> 5m -> 15m).
+# y construccion de temporalidades (1m -> 5m -> 15m -> 1h -> 2h -> 4h -> D -> W).
 # =============================================================================
 
 use strict;
@@ -14,17 +14,38 @@ use Time::Moment;
 my @DAY_NAMES = qw(Mon Tue Wed Thu Fri Sat Sun);
 
 # -----------------------------------------------------------------------------
+# Temporalidades derivadas soportadas (todo excepto 1m, que es la base
+# alimentada directamente por add_candle).
+# -----------------------------------------------------------------------------
+my @DERIVED_TIMEFRAMES = qw(5m 15m 1h 2h 4h D W);
+
+# Temporalidades intradia que se agregan por bucketing directo sobre el
+# epoch (igual que 5m/15m en Fase 1). Estos intervalos dividen exacto a
+# 1440 min/dia, asi que el ancla es estable sin convertir a zona local.
+my %TF_MINUTES = (
+    '5m'  => 5,
+    '15m' => 15,
+    '1h'  => 60,
+    '2h'  => 120,
+    '4h'  => 240,
+);
+
+# Ancla horaria para D y W: GMT-5, consistente con el resto del sistema
+# (PricePanel/ChartEngine ya usan gmtime($ts+5*3600) para etiquetas de
+# dia/fecha). Offset en minutos para Time::Moment->from_epoch.
+use constant GMT_OFFSET_MIN => -300;
+
+# -----------------------------------------------------------------------------
 # new
 # -----------------------------------------------------------------------------
 sub new {
     my ($class) = @_;
+    my %data = ( '1m' => [] );
+    $data{$_} = [] for @DERIVED_TIMEFRAMES;
+
     my $self = {
-        data => {
-            '1m'  => [],
-            '5m'  => [],
-            '15m' => [],
-        },
-        tf => '1m',
+        data => \%data,
+        tf   => '1m',
     };
     bless $self, $class;
     return $self;
@@ -41,23 +62,62 @@ sub add_candle {
 }
 
 # -----------------------------------------------------------------------------
+# _bucket_ts_for (privado)
+# Calcula el timestamp de "inicio de bucket" para una vela 1m dada,
+# segun la temporalidad destino. Centraliza la decision de anclaje:
+#   - 5m/15m/1h/2h/4h -> bucketing directo sobre el epoch (UTC).
+#   - D               -> medianoche GMT-5.
+#   - W               -> 00:00 del lunes en GMT-5.
+# -----------------------------------------------------------------------------
+sub _bucket_ts_for {
+    my ($self, $ts, $tf) = @_;
+
+    if (exists $TF_MINUTES{$tf}) {
+        my $interval_sec = $TF_MINUTES{$tf} * 60;
+        return int($ts / $interval_sec) * $interval_sec;
+    }
+
+    if ($tf eq 'D') {
+        my $tm = Time::Moment->from_epoch($ts)->with_offset_same_instant(GMT_OFFSET_MIN);
+        return $self->_truncate_to_midnight($tm)->epoch;
+    }
+
+    if ($tf eq 'W') {
+        my $tm  = Time::Moment->from_epoch($ts)->with_offset_same_instant(GMT_OFFSET_MIN);
+        my $dow = $tm->day_of_week;   # 1=Lunes .. 7=Domingo (ISO 8601)
+        return $self->_truncate_to_midnight($tm)->minus_days($dow - 1)->epoch;
+    }
+
+    return undef;
+}
+
+# -----------------------------------------------------------------------------
+# _truncate_to_midnight (privado)
+# Trunca un Time::Moment a las 00:00:00.000000000 de su mismo dia/offset.
+# Existe porque esta version de Time::Moment no expone at_start_of_day.
+# -----------------------------------------------------------------------------
+sub _truncate_to_midnight {
+    my ($self, $tm) = @_;
+    return $tm->with_hour(0)->with_minute(0)->with_second(0)->with_nanosecond(0);
+}
+
+# -----------------------------------------------------------------------------
 # build_tf_candles
-# FIX: Agrupacion anclada al reloj (Clock-Aligned Grouping).
-# Se utiliza el timestamp (Epoch) para forzar que las velas de 5m/15m
-# nazcan en multiplos exactos del reloj (ej. 23:20, 23:25), resolviendo
-# desfases y huecos de mercado (missing candles).
+# FIX: Agrupacion anclada al reloj (Clock-Aligned Grouping), generalizada
+# a las 7 temporalidades derivadas. _bucket_ts_for decide la frontera
+# correcta (epoch o calendario GMT-5 segun el caso), resolviendo desfases
+# y huecos de mercado (missing candles) igual que en Fase 1.
 # -----------------------------------------------------------------------------
 sub build_tf_candles {
     my ($self, $tf) = @_;
-    my %minutes = ('5m' => 5, '15m' => 15);
-    my $n = $minutes{$tf} or return;
-    my $interval_sec = $n * 60;
+    return unless exists $TF_MINUTES{$tf} || $tf eq 'D' || $tf eq 'W';
+
     my $src = $self->{data}{'1m'};
     my @result;
     my $current_candle = undef;
 
     for my $c (@$src) {
-        my $bucket_ts = int($c->{ts} / $interval_sec) * $interval_sec;
+        my $bucket_ts = $self->_bucket_ts_for($c->{ts}, $tf);
 
         if (!defined $current_candle || $current_candle->{ts} != $bucket_ts) {
             push @result, $current_candle if defined $current_candle;
@@ -85,8 +145,7 @@ sub build_tf_candles {
 
 sub build_timeframes {
     my ($self) = @_;
-    $self->build_tf_candles('5m');
-    $self->build_tf_candles('15m');
+    $self->build_tf_candles($_) for @DERIVED_TIMEFRAMES;
 }
 
 sub set_timeframe {
