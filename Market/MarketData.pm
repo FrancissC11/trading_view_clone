@@ -46,9 +46,66 @@ sub new {
     my $self = {
         data => \%data,
         tf   => '1m',
+        # -----------------------------------------------------------------
+        # Frontera de Replay (Fase 2). undef = modo "en vivo" (sin replay).
+        # Cuando esta definida (epoch en segundos), TODOS los accesores de
+        # lectura (size, last_index, get_candle, get_slice, last_candle,
+        # get_timestamp) recortan el array activo de forma transparente:
+        # el resto del sistema (IndicatorManager, ChartEngine, Overlays)
+        # sigue preguntando exactamente igual que en Fase 1 y "ve menos"
+        # automaticamente, garantizando que nunca se filtren velas futuras.
+        # -----------------------------------------------------------------
+        replay_ts => undef,
     };
     bless $self, $class;
     return $self;
+}
+
+# -----------------------------------------------------------------------------
+# Frontera de Replay -- API publica
+# -----------------------------------------------------------------------------
+sub set_replay_ts { $_[0]->{replay_ts} = $_[1]; }
+sub clear_replay  { $_[0]->{replay_ts} = undef; }
+sub replay_ts     { $_[0]->{replay_ts}; }
+sub is_replay     { defined $_[0]->{replay_ts} ? 1 : 0; }
+
+# -----------------------------------------------------------------------------
+# Accesores que IGNORAN la frontera de replay (vision completa del dataset).
+# Solo los usa el controlador de replay (ChartEngine) para avanzar/retroceder
+# el puntero sobre el dataset real, nunca el pipeline de render.
+# -----------------------------------------------------------------------------
+sub full_last_index { return $#{ $_[0]->_active_array }; }
+sub full_size       { return scalar @{ $_[0]->_active_array }; }
+
+sub full_ts_at {
+    my ($self, $i) = @_;
+    my $arr = $self->_active_array;
+    return undef if $i < 0 || $i > $#$arr;
+    return $arr->[$i]{ts};
+}
+
+# -----------------------------------------------------------------------------
+# _effective_last (privado)
+# Indice del ultimo elemento "visible" del array activo segun la frontera de
+# replay. Sin replay devuelve $#array. Con replay devuelve, por busqueda
+# binaria, el mayor indice cuya vela tiene ts <= replay_ts (-1 si la frontera
+# es anterior a la primera vela). O(log n).
+# -----------------------------------------------------------------------------
+sub _effective_last {
+    my ($self) = @_;
+    my $arr  = $self->_active_array;
+    my $last = $#$arr;
+    return $last unless defined $self->{replay_ts};
+    return $last if $last < 0;
+
+    my $ts = $self->{replay_ts};
+    my ( $lo, $hi, $res ) = ( 0, $last, -1 );
+    while ( $lo <= $hi ) {
+        my $mid = int( ( $lo + $hi ) / 2 );
+        if ( $arr->[$mid]{ts} <= $ts ) { $res = $mid; $lo = $mid + 1; }
+        else                            { $hi = $mid - 1; }
+    }
+    return $res;
 }
 
 sub get_data {
@@ -166,35 +223,37 @@ sub _active_array {
 sub get_slice {
     my ($self, $start, $end) = @_;
     my $arr  = $self->_active_array;
-    my $last = $#$arr;
+    my $last = $self->_effective_last;   # respeta frontera de replay
     $start   = 0     if $start < 0;
     $end     = $last if $end > $last;
-    return [] if $start > $end;
+    return [] if $last < 0 || $start > $end;
     return [ @{$arr}[$start .. $end] ];
 }
 
 sub get_candle {
     my ($self, $index) = @_;
-    my $arr = $self->_active_array;
-    return undef if $index < 0 || $index > $#$arr;
+    my $arr  = $self->_active_array;
+    my $last = $self->_effective_last;   # respeta frontera de replay
+    return undef if $index < 0 || $index > $last;
     return $arr->[$index];
 }
 
 sub size {
     my ($self) = @_;
-    return scalar @{ $self->_active_array };
+    return $self->_effective_last + 1;   # respeta frontera de replay
 }
 
 sub last_candle {
     my ($self) = @_;
-    my $arr = $self->_active_array;
-    return undef unless @$arr;
-    return $arr->[-1];
+    my $arr  = $self->_active_array;
+    my $last = $self->_effective_last;   # respeta frontera de replay
+    return undef if $last < 0;
+    return $arr->[$last];
 }
 
 sub last_index {
     my ($self) = @_;
-    return $#{ $self->_active_array };
+    return $self->_effective_last;       # respeta frontera de replay
 }
 
 sub get_timestamp {
