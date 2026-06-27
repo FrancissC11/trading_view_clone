@@ -125,6 +125,7 @@ sub render {
         ? $scale->{slice_start}
         : ( $scale->{offset} < 0 ? 0 : $scale->{offset} );
 
+    my $plot_w = $scale->_plot_w;
     for my $i ( 0 .. $#$data ) {
         my $c   = $data->[$i];
         my $idx = $i + $start_idx;
@@ -132,6 +133,8 @@ sub render {
 
         next if ( $c->{low} > $scale->{max_val} );
         next if ( $c->{high} < $scale->{min_val} );
+        next if ( $cx + $body_w / 2 < 0 );        # completamente fuera izquierda
+        next if ( $cx - $body_w / 2 >= $plot_w ); # completamente fuera derecha
 
         my $y_open  = $scale->value_to_y( $c->{open} );
         my $y_high  = $scale->value_to_y( $c->{high} );
@@ -147,25 +150,33 @@ sub render {
         my $body_h = $y_bot - $y_top;
         $body_h = MIN_BODY_H if $body_h < MIN_BODY_H;
 
+        # Recortar borde derecho del cuerpo al limite del area de plot
+        my $body_x1 = $cx - $body_w / 2;
+        my $body_x2 = $cx + $body_w / 2;
+        $body_x2 = $plot_w if $body_x2 > $plot_w;
+
         $canvas->createRectangle(
-            $cx - $body_w / 2, $y_top,
-            $cx + $body_w / 2, $y_top + $body_h,
+            $body_x1, $y_top,
+            $body_x2, $y_top + $body_h,
             -fill    => $color,
             -outline => $border,
             -tags    => ['candle'],
         );
 
-        $canvas->createLine(
-            $cx, $y_high, $cx, $y_top,
-            -fill => $color,
-            -tags => ['candle']
-        );
+        # Mechas solo si el centro esta dentro del area de plot
+        if ( $cx <= $plot_w ) {
+            $canvas->createLine(
+                $cx, $y_high, $cx, $y_top,
+                -fill => $color,
+                -tags => ['candle']
+            );
 
-        $canvas->createLine(
-            $cx, $y_top + $body_h, $cx, $y_low,
-            -fill => $color,
-            -tags => ['candle']
-        );
+            $canvas->createLine(
+                $cx, $y_top + $body_h, $cx, $y_low,
+                -fill => $color,
+                -tags => ['candle']
+            );
+        }
     }
 }
 
