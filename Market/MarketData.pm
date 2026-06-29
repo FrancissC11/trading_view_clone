@@ -260,6 +260,60 @@ sub raw_get_candle {
     return $arr->[$index];
 }
 
+# -----------------------------------------------------------------------------
+# tf_interval_seconds (Etapa 6, Fase 2)
+# Ancho de bucket en segundos para una temporalidad dada. Para 1m/5m/15m/
+# 1h/2h/4h es fijo (TF_MINUTES*60); para D y W tambien es fijo (86400 y
+# 7*86400) porque ambos se anclan a un punto de calendario regular (medianoche
+# GMT-5, lunes 00:00 GMT-5) con ancho constante. Uso: calcular la ventana
+# [ts, ts+interval) de la vela "macro" activa para el pesado de volumen
+# multi-temporal.
+# -----------------------------------------------------------------------------
+my %TF_SECONDS_FIXED = ( 'D' => 86400, 'W' => 7 * 86400 );
+
+sub tf_interval_seconds {
+    my ( $self, $tf ) = @_;
+    return $TF_MINUTES{$tf} * 60 if exists $TF_MINUTES{$tf};
+    return $TF_SECONDS_FIXED{$tf} if exists $TF_SECONDS_FIXED{$tf};
+    return undef;   # '1m' u otra clave desconocida: no aplica bucket derivado
+}
+
+# -----------------------------------------------------------------------------
+# sum_volume_for_tf_window (Etapa 6, Fase 2)
+# Suma el volumen de las velas de la temporalidad $tf (cualquiera, NO
+# necesariamente la activa) cuyo ts cae en [$ts_start, $ts_end). Respeta la
+# frontera de replay si esta activa (nunca debe sumar volumen de velas, de
+# NINGUNA temporalidad, posteriores al puntero vigente) -- por eso esto vive
+# en MarketData y no en Liquidity.pm, que no deberia tener que conocer la
+# frontera de replay directamente.
+# -----------------------------------------------------------------------------
+sub sum_volume_for_tf_window {
+    my ( $self, $tf, $ts_start, $ts_end ) = @_;
+    return 0 unless exists $self->{data}{$tf};
+
+    my $arr = $self->{data}{$tf};
+    return 0 unless @$arr;
+
+    my $boundary = $self->{replay_boundary_ts};
+
+    # Busqueda binaria del primer indice con ts >= ts_start.
+    my ( $lo, $hi ) = ( 0, $#$arr );
+    while ( $lo <= $hi ) {
+        my $mid = int( ( $lo + $hi ) / 2 );
+        if ( $arr->[$mid]{ts} < $ts_start ) { $lo = $mid + 1; }
+        else                                { $hi = $mid - 1; }
+    }
+
+    my $sum = 0;
+    for my $i ( $lo .. $#$arr ) {
+        my $c = $arr->[$i];
+        last if $c->{ts} >= $ts_end;
+        last if defined $boundary && $c->{ts} > $boundary;
+        $sum += $c->{volume};
+    }
+    return $sum;
+}
+
 sub get_slice {
     my ($self, $start, $end) = @_;
     my $arr  = $self->_active_array;

@@ -16,13 +16,25 @@ package Market::Indicators::Liquidity;
 #   get_swings()       -> [ {id,index,ts,price,kind:'H'|'L'}, ... ]
 #   get_levels()       -> [ {id,side:'buy'|'sell',price,index,state,
 #                             classification,swept_at_index,
-#                             resolved_at_index}, ... ]
+#                             resolved_at_index,origin_tf,
+#                             volumes:{'1m'=>N,'5m'=>N,'15m'=>N}}, ... ]
 #   get_equals()       -> [ {kind:'EQH'|'EQL',i1,i2,p1,p2}, ... ]
 #   get_events()       -> [ {type:'SWEEP'|'GRAB'|'RUN',dir:'up'|'down',
 #                             index,price,label}, ... ]
 #   last_swing_high()  -> {index,price,...} | undef
 #   last_swing_low()   -> {index,price,...} | undef
 #   side_label($side)  -> 'BSL' | 'SSL'
+#   is_internal($level,$current_tf) -> 1|0  (ver nota de alcance Etapa 6)
+#
+# ETAPA 6 (peso de volumen multi-temporal + Interna/Externa):
+#   Cada nivel almacena, ademas, el volumen 1m/5m/15m observado durante la
+#   ventana [ts,ts+interval) de su vela de origen, en la TF que estaba
+#   activa al crearse (origin_tf). NOTA DE ALCANCE: con la arquitectura
+#   actual (una sola instancia de Liquidity viva por TF -- cualquier cambio
+#   de TF dispara reset_all+rebuild_all desde cero) NUNCA puede existir un
+#   nivel "Externo" en sentido estricto: is_internal() siempre devolvera 1
+#   en esta entrega. La coexistencia real multi-TF (necesaria para que
+#   "Externa" tenga un caso real) se reserva para la 2a entrega.
 #
 # GARANTIA DE NO-FUGA DE FUTURO:
 #   - Swings: un swing en el indice c con profundidad k SOLO es
@@ -195,15 +207,15 @@ sub _evaluate_swing_candidate {
         last if !$is_high && !$is_low;
     }
 
-    $self->_register_swing( 'H', $candle, $c ) if $is_high;
-    $self->_register_swing( 'L', $candle, $c ) if $is_low;
+    $self->_register_swing( 'H', $market_data, $candle, $c ) if $is_high;
+    $self->_register_swing( 'L', $market_data, $candle, $c ) if $is_low;
 }
 
 # -----------------------------------------------------------------------------
 # _register_swing (privado)
 # -----------------------------------------------------------------------------
 sub _register_swing {
-    my ( $self, $kind, $candle, $idx ) = @_;
+    my ( $self, $kind, $market_data, $candle, $idx ) = @_;
 
     my $swing = {
         id    => $self->{_next_id}++,
@@ -214,7 +226,7 @@ sub _register_swing {
     };
     push @{ $self->{swings} }, $swing;
 
-    my $level = $self->_register_level( $kind, $swing );
+    my $level = $self->_register_level( $kind, $swing, $market_data );
     push @{ $self->{_open_level_refs} }, $level;
 
     $self->_check_equal_levels( $kind, $swing );
@@ -226,7 +238,7 @@ sub _register_swing {
 # Nace en estado DETECTED (Estado 1 del diagrama del PDF).
 # -----------------------------------------------------------------------------
 sub _register_level {
-    my ( $self, $kind, $swing ) = @_;
+    my ( $self, $kind, $swing, $market_data ) = @_;
 
     my $level = {
         id                => $self->{_next_id}++,
@@ -238,9 +250,64 @@ sub _register_level {
         classification    => undef,
         swept_at_index    => undef,
         resolved_at_index => undef,
+
+        # Etapa 6 (Fase 2): pesado de volumen multi-temporal + origen de TF.
+        origin_tf => undef,
+        volumes   => { '1m' => 0, '5m' => 0, '15m' => 0 },
     };
+
+    $self->_attach_multi_tf_volume( $level, $swing, $market_data ) if $market_data;
+
     push @{ $self->{levels} }, $level;
     return $level;
+}
+
+# -----------------------------------------------------------------------------
+# _attach_multi_tf_volume (privado) -- Etapa 6, Fase 2
+# Calcula y almacena en el nivel el volumen observado en 1m/5m/15m durante
+# la ventana [ts, ts+interval) de la vela "macro" (TF activa al momento de
+# crear el nivel), independientemente de cual sea esa TF activa. Tambien
+# registra origin_tf (infraestructura para Interna/Externa -- ver nota de
+# alcance en la cabecera del archivo).
+#
+# NOTA: si la TF activa es 1m/5m/15m, el calculo sigue siendo correcto pero
+# parcialmente degenerado (alguna de las 3 sub-temporalidades puede no
+# "encajar" una vela completa dentro de una ventana mas angosta que su
+# propio ancho de bucket -- ver MarketData::sum_volume_for_tf_window). No es
+# un error: es la consecuencia matematica de pedir un desglose mas fino que
+# el ancho de la propia ventana.
+# -----------------------------------------------------------------------------
+sub _attach_multi_tf_volume {
+    my ( $self, $level, $swing, $market_data ) = @_;
+
+    my $tf = $market_data->get_timeframe;
+    $level->{origin_tf} = $tf;
+
+    my $interval = $market_data->tf_interval_seconds($tf);
+    return unless defined $interval;   # TF desconocida: deja volumes en 0
+
+    my $ts_start = $swing->{ts};
+    my $ts_end   = $ts_start + $interval;
+
+    for my $sub_tf ( '1m', '5m', '15m' ) {
+        $level->{volumes}{$sub_tf} =
+            $market_data->sum_volume_for_tf_window( $sub_tf, $ts_start, $ts_end );
+    }
+}
+
+# -----------------------------------------------------------------------------
+# is_internal (Etapa 6, Fase 2)
+# Compara el origin_tf del nivel contra la TF actualmente activa. Con la
+# arquitectura actual (una sola instancia de Liquidity viva por TF, ver nota
+# de alcance en la cabecera) esto sera SIEMPRE 1 (todo nivel vigente fue
+# creado en la TF que esta activa ahora, porque cualquier cambio de TF
+# reconstruye el indicador desde cero). El campo y el metodo quedan listos
+# para cuando exista coexistencia real multi-TF (2a entrega).
+# -----------------------------------------------------------------------------
+sub is_internal {
+    my ( $self, $level, $current_tf ) = @_;
+    return 1 unless defined $level->{origin_tf};
+    return $level->{origin_tf} eq $current_tf ? 1 : 0;
 }
 
 # -----------------------------------------------------------------------------
