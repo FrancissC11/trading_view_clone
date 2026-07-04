@@ -138,8 +138,9 @@ sub _update_swing_structure {
         $self->{_new_sl_since_last_up} = 1;
     }
 
-    @{ $self->{_struct_swings} } = sort { $a->{index} <=> $b->{index} }
-                                        @{ $self->{_struct_swings} };
+    # FIX-SMC1: sin sort en cada vela (O(n log n) * n_velas = O(n^2 log n)).
+    # Los swings de Liquidity ya llegan en orden de confirmacion (monotono
+    # creciente en index), asi que _struct_swings ya esta ordenado.
 }
 
 # -----------------------------------------------------------------------------

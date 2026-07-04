@@ -92,6 +92,11 @@ sub new {
         equals => [],   # pares EQH/EQL (puramente geometrico, no es un "nivel")
         events => [],   # eventos Sweep/Grab/Run ya resueltos
 
+        # FIX-1: indices separados por tipo para O(1) en last_swing_high/low
+        # y para _check_equal_levels sin iterar toda la lista mezclada.
+        _swings_H => [],
+        _swings_L => [],
+
         _open_level_refs      => [],   # niveles en DETECTED o SWEPT (working set)
         _next_id               => 1,
         _last_evaluated_index  => -1,  # ultimo candidato de swing ya evaluado
@@ -114,6 +119,8 @@ sub reset {
     $self->{levels} = [];
     $self->{equals} = [];
     $self->{events} = [];
+    $self->{_swings_H}            = [];
+    $self->{_swings_L}            = [];
     $self->{_open_level_refs}     = [];
     $self->{_next_id}             = 1;
     $self->{_last_evaluated_index} = -1;
@@ -130,18 +137,12 @@ sub get_events { return $_[0]->{events}; }
 
 sub last_swing_high {
     my ($self) = @_;
-    for my $sw ( reverse @{ $self->{swings} } ) {
-        return $sw if $sw->{kind} eq 'H';
-    }
-    return undef;
+    return $self->{_swings_H}[-1];   # FIX-2: O(1)
 }
 
 sub last_swing_low {
     my ($self) = @_;
-    for my $sw ( reverse @{ $self->{swings} } ) {
-        return $sw if $sw->{kind} eq 'L';
-    }
-    return undef;
+    return $self->{_swings_L}[-1];   # FIX-2: O(1)
 }
 
 sub side_label {
@@ -253,34 +254,14 @@ sub _register_swing {
         price => ( $kind eq 'H' ? $candle->{high} : $candle->{low} ),
     };
     push @{ $self->{swings} }, $swing;
+    push @{ $self->{ $kind eq 'H' ? '_swings_H' : '_swings_L' } }, $swing;  # FIX-3
 
     my $level = $self->_register_level( $kind, $swing, $market_data );
 
-    # ---- Anti-duplicado de niveles (working set, no el historico) ----
-    # $level ya fue agregado a $self->{levels} dentro de _register_level
-    # (eso NO se toca: cada swing siempre genera su registro historico).
-    # Lo que se evita aqui es agregarlo al WORKING SET (_open_level_refs)
-    # si ya existe un nivel DETECTED/SWEPT del mismo lado a menos de
-    # 2*eq_factor*ATR de distancia -- eso es lo que produce eventos
-    # Sweep/Grab duplicados casi identicos cuando varios swings muy
-    # cercanos son barridos por el mismo movimiento de precio.
-    my $is_duplicate = 0;
-    {
-        my $atr_vals = $self->{atr} ? $self->{atr}->get_values : undef;
-        my $atr_v    = ($atr_vals && @$atr_vals) ? ($atr_vals->[-1] // 0) : 0;
-        my $tol      = $atr_v * ($self->{eq_factor} * 2.0);
-        if ($tol > 0) {
-            for my $existing (@{ $self->{_open_level_refs} }) {
-                if ($existing->{side} eq $level->{side}
-                    && abs($existing->{price} - $level->{price}) <= $tol)
-                {
-                    $is_duplicate = 1;
-                    last;
-                }
-            }
-        }
-    }
-    push @{ $self->{_open_level_refs} }, $level unless $is_duplicate;
+    # FIX-4: El anti-duplicado O(n) se elimino (era el 2o mayor cuello de
+    # botella). El cap OPEN_LEVEL_CAP en _update_state_machine hace innecesario
+    # filtrar aqui: los niveles viejos nunca acumulados ya se descartan ahi.
+    push @{ $self->{_open_level_refs} }, $level;
 
     $self->_check_equal_levels( $kind, $swing );
 }
@@ -370,6 +351,9 @@ sub is_internal {
 # get_equals() (puramente geometrica/informativa, no crea un nivel nuevo
 # ni afecta la maquina de estados del nivel ya registrado por el swing).
 # -----------------------------------------------------------------------------
+# Ventana maxima para EQH/EQL: mas alla de 500 velas no es relevante
+use constant EQ_WINDOW => 500;
+
 sub _check_equal_levels {
     my ( $self, $kind, $new_swing ) = @_;
     return unless $self->{atr};
@@ -382,13 +366,15 @@ sub _check_equal_levels {
 
     my $tolerance = $atr_at_new * $self->{eq_factor};
 
-    for my $prev ( @{ $self->{swings} } ) {
+    # FIX-5: usa el indice tipado (_swings_H o _swings_L) e itera en reversa
+    # con salida temprana por ventana => O(EQ_WINDOW) en vez de O(n_total)
+    my $typed   = $self->{ $kind eq 'H' ? '_swings_H' : '_swings_L' };
+    my $min_idx = $new_swing->{index} - EQ_WINDOW;
+
+    for my $prev ( reverse @$typed ) {
+        last if $prev->{index} < $min_idx;   # salida temprana
         next if $prev->{id} == $new_swing->{id};
-        next unless $prev->{kind} eq $kind;
-
-        my $diff = abs( $prev->{price} - $new_swing->{price} );
-        next if $diff > $tolerance;
-
+        next if abs( $prev->{price} - $new_swing->{price} ) > $tolerance;
         push @{ $self->{equals} }, {
             kind => ( $kind eq 'H' ? 'EQH' : 'EQL' ),
             i1   => $prev->{index},
@@ -402,6 +388,11 @@ sub _check_equal_levels {
 # =============================================================================
 # MAQUINA DE ESTADOS: Detected -> Swept -> (Acceptance|Reclaimed) -> Resolved
 # =============================================================================
+
+# Maximo de niveles activos en el working set. Los niveles mas antiguos
+# que siguen sin barrerse son structuralmente irrelevantes (el precio lleva
+# cientos de velas sin acercarse a ellos) y solo consumen CPU en cada vela.
+use constant OPEN_LEVEL_CAP => 80;
 
 sub _update_state_machine {
     my ( $self, $market_data, $i ) = @_;
@@ -418,6 +409,22 @@ sub _update_state_machine {
         }
         push @still_open, $level unless $level->{state} eq 'RESOLVED';
     }
+
+    # FIX-6: cap del working set -- si superamos el limite, descartamos los
+    # niveles DETECTED mas antiguos (los mas recientes son los relevantes).
+    # Los niveles SWEPT se conservan siempre (estan en medio de resolucion).
+    if (@still_open > OPEN_LEVEL_CAP) {
+        my @swept    = grep { $_->{state} eq 'SWEPT' }    @still_open;
+        my @detected = grep { $_->{state} eq 'DETECTED' } @still_open;
+        # Conservar los OPEN_LEVEL_CAP/2 mas recientes de los DETECTED
+        my $keep = OPEN_LEVEL_CAP - scalar @swept;
+        $keep = 0 if $keep < 0;
+        if (@detected > $keep) {
+            @detected = @detected[-$keep..-1];  # los mas recientes
+        }
+        @still_open = (@swept, @detected);
+    }
+
     $self->{_open_level_refs} = \@still_open;
 }
 
