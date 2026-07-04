@@ -82,6 +82,7 @@ sub new {
     my $self = {
         k            => $args{k}            // 3,
         eq_factor    => $args{eq_factor}    // 0.10,
+        eq_lookback  => $args{eq_lookback}  // 50,
         grab_window  => $args{grab_window}  // 2,
         acceptance_n => $args{acceptance_n} // 5,
         atr_factor   => $args{atr_factor}   // 0.30,
@@ -365,10 +366,15 @@ sub is_internal {
 
 # -----------------------------------------------------------------------------
 # _check_equal_levels (privado)
-# Compara el swing recien confirmado contra TODOS los swings previos del
-# mismo tipo. Cada par dentro de tolerancia genera una entrada en
-# get_equals() (puramente geometrica/informativa, no crea un nivel nuevo
-# ni afecta la maquina de estados del nivel ya registrado por el swing).
+# Empareja el swing recien confirmado con el swing previo MAS RECIENTE del
+# mismo tipo que este dentro de tolerancia, y crea UN solo par EQH/EQL.
+#
+# Antes se comparaba contra TODOS los previos y se creaba un par por cada uno
+# -> N lineas/etiquetas solapadas sobre la misma zona (ruido, spec 12). Al
+# encadenar solo con el vecino inmediato, varios maximos/minimos "iguales"
+# consecutivos forman un unico cluster horizontal limpio en lugar de una
+# maraña de segmentos cruzados. (Puramente geometrico: no crea un nivel nuevo
+# ni afecta la maquina de estados del nivel ya registrado por el swing.)
 # -----------------------------------------------------------------------------
 sub _check_equal_levels {
     my ( $self, $kind, $new_swing ) = @_;
@@ -382,7 +388,18 @@ sub _check_equal_levels {
 
     my $tolerance = $atr_at_new * $self->{eq_factor};
 
-    for my $prev ( @{ $self->{swings} } ) {
+    # Recorrer de mas reciente a mas antiguo y detenerse en el primer swing
+    # del mismo tipo dentro de tolerancia. Se limita la busqueda a los ultimos
+    # eq_lookback swings: los EQH/EQL son un fenomeno LOCAL (maximos/minimos
+    # cercanos en el tiempo) y ademas evita el coste O(n^2) de escanear todo el
+    # historico cuando un swing no tiene par (lo que congelaba el rebuild del
+    # replay en datasets grandes).
+    my $swings   = $self->{swings};
+    my $lookback = $self->{eq_lookback};
+    my $stop     = $#$swings - $lookback;
+    $stop = 0 if $stop < 0;
+    for (my $j = $#$swings; $j >= $stop; $j--) {
+        my $prev = $swings->[$j];
         next if $prev->{id} == $new_swing->{id};
         next unless $prev->{kind} eq $kind;
 
@@ -396,6 +413,7 @@ sub _check_equal_levels {
             p1   => $prev->{price},
             p2   => $new_swing->{price},
         };
+        last;   # solo el vecino igual mas cercano -> una sola zona
     }
 }
 

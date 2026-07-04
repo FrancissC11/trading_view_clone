@@ -20,6 +20,12 @@ use POSIX qw(floor);
 
 use constant TAG => 'overlay_smc';
 
+# Sub-tags de las ZONAS (rectangulos) que deben quedar DETRAS de las velas.
+# ChartEngine las baja bajo el tag 'candle' tras dibujar el overlay, para que
+# FVG/OB no tapen cuerpos ni mechas (los chips/etiquetas siguen al frente).
+use constant TAG_FVG => 'smc_fvg_zone';
+use constant TAG_OB  => 'smc_ob_zone';
+
 use constant {
     C_BOS_UP    => '#26a69a',   # BOS alcista   (verde teal)
     C_BOS_DN    => '#ef5350',   # BOS bajista   (rojo)
@@ -92,6 +98,11 @@ sub _render_struct {
     }
 
     # --- Etiquetas HH / HL / LH / LL ---
+    # El punto (circulo) siempre se dibuja para marcar el vertice del zigzag,
+    # pero el TEXTO se omite si hay otra etiqueta del mismo lado demasiado cerca
+    # en horizontal (spec 10: no mostrar etiquetas demasiado juntas). Los highs
+    # etiquetan ARRIBA y los lows ABAJO -> no tapan las velas.
+    my (@lbl_hi, @lbl_lo);   # posiciones X de etiquetas ya puestas por lado
     for my $sw (@$swings) {
         next if $sw->{index} < $off || $sw->{index} > $off + $vb;
         next unless $scale->value_in_range($sw->{price});
@@ -104,6 +115,11 @@ sub _render_struct {
         # Punto de pivote (circulo pequeno)
         $canvas->createOval($x-3, $y-3, $x+3, $y+3,
             -fill => $color, -outline => $color, -tags => [TAG]);
+
+        my $slot = $up ? \@lbl_hi : \@lbl_lo;
+        my $too_close = grep { abs($_ - $x) < 26 } @$slot;
+        next if $too_close;
+        push @$slot, $x;
 
         $self->_chip($canvas, $x, $y, $sw->{label},
             -color  => $color,
@@ -193,7 +209,7 @@ sub _render_fvgs {
         my $line = _mix($base, 0.25 + 0.25 * $fresh);
 
         $canvas->createRectangle($x1, $yt, $x2, $yb,
-            -fill => $fill, -outline => $line, -width => 1, -tags => [TAG]);
+            -fill => $fill, -outline => $line, -width => 1, -tags => [TAG, TAG_FVG]);
 
         # Chip: si hay OB activo en la misma zona, muestra "OB" en vez de "FVG"
         if (($yb - $yt) >= 14 && $age <= int($max_age * 0.6)) {
@@ -269,7 +285,7 @@ sub _render_obs {
             -outline => $color,
             -width   => 1,
             -dash    => [4, 3],
-            -tags    => [TAG]);
+            -tags    => [TAG, TAG_OB]);
 
         # Etiqueta "OB" en el lado izquierdo de la zona
         my $cy = ($yt + $yb) / 2;

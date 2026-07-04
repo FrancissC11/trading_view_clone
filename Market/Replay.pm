@@ -39,16 +39,18 @@ sub new {
     my $self = {
         market     => $args{market},
         indicators => $args{indicators},
-        schedule   => $args{schedule},    # sub($delay_ms, $cb)
+        schedule   => $args{schedule},    # sub($delay_ms, $cb) -> devuelve after_id
+        cancel     => $args{cancel},      # sub($after_id)       -> afterCancel
         on_change  => $args{on_change},   # sub() -> notifica a la UI
 
         play_interval_ms  => $args{play_interval_ms}  // 200,
         fast_forward_step => $args{fast_forward_step} // 5,
 
-        _active  => 0,
-        _playing => 0,
-        _fast    => 0,
-        _ts      => undef,
+        _active   => 0,
+        _playing  => 0,
+        _fast     => 0,
+        _ts       => undef,
+        _after_id => undef,   # id del after pendiente (para poder cancelarlo)
     };
     bless $self, $class;
     return $self;
@@ -74,6 +76,7 @@ sub start {
     my ($self, $ts) = @_;
     return unless defined $ts;
 
+    $self->_cancel_tick;   # mata cualquier tick en curso antes de reposicionar
     $self->{_active}  = 1;
     $self->{_playing} = 0;
     $self->{_fast}    = 0;
@@ -172,6 +175,7 @@ sub pause {
     my ($self) = @_;
     return unless $self->{_playing};
     $self->{_playing} = 0;
+    $self->_cancel_tick;   # cancela el after pendiente (spec 24)
     $self->_notify;
 }
 
@@ -187,12 +191,29 @@ sub _schedule_tick {
     return unless $self->{_playing};
     return unless $self->{schedule};
 
-    $self->{schedule}->( $self->{play_interval_ms}, sub {
+    # Guardar el id del after para poder cancelarlo (evita ticks duplicados si
+    # se pausa/sale/reposiciona mientras hay uno pendiente). Solo hay un tick
+    # pendiente a la vez: la cadena es estrictamente secuencial.
+    $self->{_after_id} = $self->{schedule}->( $self->{play_interval_ms}, sub {
+        $self->{_after_id} = undef;
         return unless $self->{_playing};
         my $step_n = $self->{_fast} ? $self->{fast_forward_step} : 1;
         $self->step_forward($step_n);
         $self->_schedule_tick if $self->{_playing};
     });
+}
+
+# -----------------------------------------------------------------------------
+# _cancel_tick (privado): cancela el after pendiente via el callback inyectado
+# (en produccion, $canvas->afterCancel). Idempotente. Es la contraparte del
+# schedule y la clave para que Pause/Exit/Start no dejen timers colgados que
+# sigan avanzando el replay "por su cuenta" (spec 24).
+# -----------------------------------------------------------------------------
+sub _cancel_tick {
+    my ($self) = @_;
+    return unless defined $self->{_after_id};
+    $self->{cancel}->( $self->{_after_id} ) if $self->{cancel};
+    $self->{_after_id} = undef;
 }
 
 sub _auto_pause_if_at_end {
@@ -211,6 +232,7 @@ sub _auto_pause_if_at_end {
 # -----------------------------------------------------------------------------
 sub exit_replay {
     my ($self) = @_;
+    $self->_cancel_tick;   # detener cualquier tick pendiente antes de salir
     $self->{_playing} = 0;
     $self->{_active}  = 0;
     $self->{_fast}    = 0;

@@ -199,6 +199,7 @@ sub _render_events {
     my $start = $#$events - MAX_EVENTS;
     $start = 0 if $start < 0;
 
+    my @drawn;   # [x, y, type] de eventos ya dibujados (anti-repeticion)
     for ( my $k = $#$events ; $k >= $start ; $k-- ) {
         my $ev = $events->[$k];
         my $t  = $ev->{type};
@@ -211,6 +212,21 @@ sub _render_events {
 
         my $x = $scale->index_to_center_x( $ev->{index} );
         my $y = $scale->value_to_y( $ev->{price} );
+
+        # Anti-repeticion: si ya se dibujo un evento del MISMO tipo muy cerca,
+        # se omite. Evita la maraña de etiquetas Sweep/Grab/Run repetidas sobre
+        # la misma zona de liquidez (spec 15: tratar señales dentro de la misma
+        # tolerancia como una sola). Se recorre de mas reciente a mas antiguo,
+        # asi que se conserva el evento mas nuevo de cada cluster.
+        my $dup = 0;
+        for my $d (@drawn) {
+            next unless $d->[2] eq $t;
+            if ( abs( $d->[0] - $x ) < 48 && abs( $d->[1] - $y ) < 30 ) {
+                $dup = 1; last;
+            }
+        }
+        next if $dup;
+        push @drawn, [ $x, $y, $t ];
         my $color =
             ( $t eq 'GRAB' ) ? C_GRAB
           : ( $t eq 'RUN' )  ? C_RUN

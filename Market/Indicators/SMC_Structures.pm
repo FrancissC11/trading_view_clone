@@ -12,6 +12,18 @@ sub new {
         min_fvg_atr_mult   => $args{min_fvg_atr_mult}  // 0.20,
         ob_proximity_mult  => $args{ob_proximity_mult}  // 6.0,
 
+        # --- Filtros de la linea estructural (ZigZag de ESTRUCTURA MAYOR) ---
+        # Una nueva pierna (pivote de lado opuesto) solo se acepta si el
+        # movimiento contra el pivote anterior supera struct_atr_mult*ATR y
+        # ademas hay al menos struct_min_bars velas de separacion. Los pivotes
+        # del mismo lado se fusionan conservando el extremo mas relevante, y la
+        # consistencia direccional descarta pivotes solapados. Con un umbral
+        # alto (~2.5) la linea representa la estructura mayor del mercado y los
+        # retrocesos internos NO la cortan (spec 1/7). Subir el factor => linea
+        # aun mas limpia; bajarlo => mas detalle. structure_atr_factor del PDF.
+        struct_atr_mult    => $args{struct_atr_mult}   // 2.5,
+        struct_min_bars    => $args{struct_min_bars}   // 3,
+
         _c            => [],
         _fvgs         => [],
         _active_fvgs  => [],
@@ -20,8 +32,6 @@ sub new {
         _active_obs   => [],
 
         _struct_swings  => [],
-        _last_sh_price  => undef,
-        _last_sl_price  => undef,
         _seen_sh_idx    => -1,
         _seen_sl_idx    => -1,
         _last_hh => undef, _last_hl => undef,
@@ -53,8 +63,6 @@ sub reset {
     $self->{_order_blocks} = [];
     $self->{_active_obs}   = [];
     $self->{_struct_swings}  = [];
-    $self->{_last_sh_price}  = undef;
-    $self->{_last_sl_price}  = undef;
     $self->{_seen_sh_idx}    = -1;
     $self->{_seen_sl_idx}    = -1;
     $self->{_last_hh} = $self->{_last_hl} = undef;
@@ -92,54 +100,165 @@ sub _process {
 }
 
 # -----------------------------------------------------------------------------
-# _update_swing_structure: clasifica nuevos swings como HH/HL/LH/LL
-# Compara cada nuevo swing high con el previo (HH si es mayor, LH si menor),
-# igual para lows (HL si mayor, LL si menor). Mantiene los 4 niveles
-# estructurales vigentes para que _detect_bos_choch use los correctos.
+# _update_swing_structure: construye una linea estructural LIMPIA y ALTERNADA
+# (ZigZag) a partir de los swings confirmados por Liquidity.
+#
+# La causa del "ruido" no eran los swings (ya vienen filtrados por ATR), sino
+# que ANTES cada swing se convertia directamente en un pivote de la linea. Aqui,
+# en cambio, la lista _struct_swings mantiene la invariante de ALTERNANCIA
+# (H, L, H, L, ...) aplicando dos reglas (spec 7 y 26):
+#   1) Swing del MISMO lado que el ultimo pivote -> es la misma pierna: se
+#      conserva el mas relevante (high mas alto / low mas bajo), reemplazando.
+#   2) Swing del lado OPUESTO -> posible pierna nueva: solo se acepta si el
+#      movimiento supera struct_atr_mult*ATR y hay struct_min_bars de
+#      separacion; si no, es un micro-movimiento y se descarta.
+# Las etiquetas HH/HL/LH/LL y los niveles _last_* (que usa _detect_bos_choch)
+# se derivan siempre de esta lista ya limpia.
 # -----------------------------------------------------------------------------
 sub _update_swing_structure {
     my ($self) = @_;
     my $liq = $self->{liquidity};
     return unless $liq;
 
+    # Recolectar los swings recien confirmados en este tick.
+    my @incoming;
     my $sh = $liq->last_swing_high;
     if ($sh && $sh->{index} != $self->{_seen_sh_idx}) {
-        my $label = (!defined $self->{_last_sh_price})          ? 'HH'
-                  : ($sh->{price} > $self->{_last_sh_price})    ? 'HH'
-                  :                                                'LH';
-
-        push @{ $self->{_struct_swings} }, {
-            index => $sh->{index}, price => $sh->{price},
-            kind  => 'H',         label => $label, ts => $sh->{ts},
-        };
-        if ($label eq 'HH') { $self->{_last_hh} = {index=>$sh->{index}, price=>$sh->{price}}; }
-        else                 { $self->{_last_lh} = {index=>$sh->{index}, price=>$sh->{price}}; }
-
-        $self->{_last_sh_price}          = $sh->{price};
-        $self->{_seen_sh_idx}            = $sh->{index};
-        $self->{_new_sh_since_last_down} = 1;
+        push @incoming, { kind => 'H', index => $sh->{index},
+                          price => $sh->{price}, ts => $sh->{ts} };
+        $self->{_seen_sh_idx} = $sh->{index};
     }
-
     my $sl = $liq->last_swing_low;
     if ($sl && $sl->{index} != $self->{_seen_sl_idx}) {
-        my $label = (!defined $self->{_last_sl_price})          ? 'LL'
-                  : ($sl->{price} < $self->{_last_sl_price})    ? 'LL'
-                  :                                                'HL';
+        push @incoming, { kind => 'L', index => $sl->{index},
+                          price => $sl->{price}, ts => $sl->{ts} };
+        $self->{_seen_sl_idx} = $sl->{index};
+    }
+    return unless @incoming;
 
-        push @{ $self->{_struct_swings} }, {
-            index => $sl->{index}, price => $sl->{price},
-            kind  => 'L',         label => $label, ts => $sl->{ts},
-        };
-        if ($label eq 'HL') { $self->{_last_hl} = {index=>$sl->{index}, price=>$sl->{price}}; }
-        else                 { $self->{_last_ll} = {index=>$sl->{index}, price=>$sl->{price}}; }
+    # Procesar en orden de indice (un mismo tick puede confirmar H y L).
+    for my $sw (sort { $a->{index} <=> $b->{index} } @incoming) {
+        $self->_add_structural_pivot($sw);
+    }
+}
 
-        $self->{_last_sl_price}        = $sl->{price};
-        $self->{_seen_sl_idx}          = $sl->{index};
-        $self->{_new_sl_since_last_up} = 1;
+# -----------------------------------------------------------------------------
+# _add_structural_pivot: aplica las reglas de alternancia/relevancia/ATR.
+# -----------------------------------------------------------------------------
+sub _add_structural_pivot {
+    my ($self, $sw) = @_;
+    my $list = $self->{_struct_swings};
+
+    if (!@$list) {
+        push @$list, _mk_pivot($sw);
+        $self->_after_struct_change($sw->{kind});
+        return;
     }
 
-    @{ $self->{_struct_swings} } = sort { $a->{index} <=> $b->{index} }
-                                        @{ $self->{_struct_swings} };
+    my $last = $list->[-1];
+
+    # Regla 1: mismo lado -> misma pierna, conservar el extremo mas relevante.
+    if ($last->{kind} eq $sw->{kind}) {
+        my $more_extreme = ($sw->{kind} eq 'H')
+            ? ($sw->{price} > $last->{price})
+            : ($sw->{price} < $last->{price});
+        if ($more_extreme) {
+            $list->[-1] = _mk_pivot($sw);
+            $self->_after_struct_change($sw->{kind});
+        }
+        return;   # menos extremo => ruido de la misma pierna, se ignora
+    }
+
+    # Regla 2: lado opuesto -> posible pierna nueva.
+
+    # 2a) Consistencia direccional: en un zigzag, un pivote L debe quedar por
+    # DEBAJO del H anterior (y un H por ENCIMA del L anterior). En rangos
+    # solapados la liquidez puede confirmar un "low" por encima del high previo
+    # (o viceversa): dibujar esa pierna daria un segmento invertido/plano
+    # (ruido). Se ignora y se deja que el pivote actual se extienda con un swing
+    # del mismo lado (p.ej. el siguiente high mas alto reemplaza al high vigente).
+    my $dir_ok = ($sw->{kind} eq 'L')
+        ? ($sw->{price} < $last->{price})
+        : ($sw->{price} > $last->{price});
+    return unless $dir_ok;
+
+    # 2b) Significancia: el movimiento debe superar struct_atr_mult*ATR y haber
+    # al menos struct_min_bars velas de separacion (evita micro-piernas).
+    my $atr_vals = $self->{atr} ? $self->{atr}->get_values : undef;
+    my $atr_val  = ($atr_vals && defined $atr_vals->[$sw->{index}])
+                 ? $atr_vals->[$sw->{index}] : 0;
+    my $min_leg  = $atr_val * $self->{struct_atr_mult};
+
+    my $move = abs($sw->{price} - $last->{price});
+    my $bars = $sw->{index} - $last->{index};
+    return if ($min_leg > 0 && $move < $min_leg);
+    return if ($bars < $self->{struct_min_bars});
+
+    push @$list, _mk_pivot($sw);
+    $self->_after_struct_change($sw->{kind});
+}
+
+# _mk_pivot: crea el pivote; la etiqueta final la fija _relabel_last.
+sub _mk_pivot {
+    my ($sw) = @_;
+    return {
+        index => $sw->{index}, price => $sw->{price},
+        kind  => $sw->{kind},
+        label => ($sw->{kind} eq 'H' ? 'HH' : 'LL'),
+        ts    => $sw->{ts},
+    };
+}
+
+# _after_struct_change: reetiqueta el ultimo pivote, refresca los niveles
+# estructurales vigentes y marca que hubo un swing nuevo de ese lado.
+sub _after_struct_change {
+    my ($self, $kind) = @_;
+    $self->_relabel_last;
+    $self->_recompute_last_levels;
+    if ($kind eq 'H') { $self->{_new_sh_since_last_down} = 1; }
+    else              { $self->{_new_sl_since_last_up}   = 1; }
+}
+
+# _relabel_last: HH/LH (o HL/LL) comparando el ultimo pivote contra el pivote
+# previo del MISMO tipo en la lista ya limpia.
+sub _relabel_last {
+    my ($self) = @_;
+    my $list = $self->{_struct_swings};
+    return unless @$list;
+    my $cur = $list->[-1];
+
+    my $prev;
+    for (my $j = $#$list - 1; $j >= 0; $j--) {
+        if ($list->[$j]{kind} eq $cur->{kind}) { $prev = $list->[$j]; last; }
+    }
+
+    if ($cur->{kind} eq 'H') {
+        $cur->{label} = (!$prev || $cur->{price} > $prev->{price}) ? 'HH' : 'LH';
+    } else {
+        $cur->{label} = (!$prev || $cur->{price} < $prev->{price}) ? 'LL' : 'HL';
+    }
+}
+
+# _recompute_last_levels: deja en _last_hh/_last_hl/_last_lh/_last_ll el pivote
+# mas reciente de cada etiqueta (los consume _detect_bos_choch). Recorre la
+# lista DESDE EL FINAL y corta en cuanto encuentra los 4 -> O(k) amortizado en
+# vez de O(n), clave para que el rebuild completo del replay no congele la GUI.
+sub _recompute_last_levels {
+    my ($self) = @_;
+    my ($hh, $hl, $lh, $ll);
+    my $list = $self->{_struct_swings};
+    for (my $j = $#$list; $j >= 0; $j--) {
+        my $p   = $list->[$j];
+        my $lab = $p->{label};
+        my $ref = { index => $p->{index}, price => $p->{price} };
+        if    ($lab eq 'HH') { $hh //= $ref; }
+        elsif ($lab eq 'LH') { $lh //= $ref; }
+        elsif ($lab eq 'HL') { $hl //= $ref; }
+        elsif ($lab eq 'LL') { $ll //= $ref; }
+        last if $hh && $hl && $lh && $ll;
+    }
+    $self->{_last_hh} = $hh; $self->{_last_hl} = $hl;
+    $self->{_last_lh} = $lh; $self->{_last_ll} = $ll;
 }
 
 # -----------------------------------------------------------------------------
@@ -183,7 +302,12 @@ sub _update_fvgs {
     my $cur = $self->{_c}[$i];
     my @keep;
     for my $f (@{ $self->{_active_fvgs} }) {
-        next if $i <= $f->{created};
+        # Aun no evaluable (misma vela de creacion): CONSERVAR en el working
+        # set. Antes se hacia 'next' aqui, lo que descartaba el FVG en su vela
+        # de creacion y hacia que NUNCA se marcara mitigado/expirado -> los FVG
+        # consumidos no desaparecian (spec 17). Ahora se mantiene y se evalua
+        # desde la vela siguiente.
+        if ($i <= $f->{created}) { push @keep, $f; next; }
         if ($f->{dir} eq 'bull' && $cur->{low} <= $f->{bottom})  { $f->{state}='mitigated'; $f->{mitig_at}=$i; next; }
         if ($f->{dir} eq 'bear' && $cur->{high} >= $f->{top})    { $f->{state}='mitigated'; $f->{mitig_at}=$i; next; }
         if (($i - $f->{created}) > $self->{max_age})             { $f->{state}='expired';   next; }
