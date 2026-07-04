@@ -80,9 +80,11 @@ use warnings;
 sub new {
     my ( $class, %args ) = @_;
     my $self = {
-        k            => $args{k}            // 3,
-        eq_factor    => $args{eq_factor}    // 0.10,
-        eq_lookback  => $args{eq_lookback}  // 50,
+        k              => $args{k}              // 3,
+        eq_factor      => $args{eq_factor}      // 0.10,
+        eq_lookback    => $args{eq_lookback}    // 50,
+        max_open_levels => $args{max_open_levels} // 150,
+        track_volume    => defined $args{track_volume} ? $args{track_volume} : 1,
         grab_window  => $args{grab_window}  // 2,
         acceptance_n => $args{acceptance_n} // 5,
         atr_factor   => $args{atr_factor}   // 0.30,
@@ -283,6 +285,16 @@ sub _register_swing {
     }
     push @{ $self->{_open_level_refs} }, $level unless $is_duplicate;
 
+    # Cap del working set: los niveles DETECTED muy antiguos (lejos en el
+    # tiempo) casi nunca se barren y solo encarecen el escaneo por vela. Se
+    # conservan los mas recientes (los SWEPT se resuelven en pocas velas, asi
+    # que quedan al final; el frente son DETECTED viejos). Escaneo acotado a
+    # max_open_levels por vela en vez de O(n) creciente.
+    my $refs = $self->{_open_level_refs};
+    if ( @$refs > $self->{max_open_levels} ) {
+        splice( @$refs, 0, @$refs - $self->{max_open_levels} );
+    }
+
     $self->_check_equal_levels( $kind, $swing );
 }
 
@@ -310,7 +322,8 @@ sub _register_level {
         volumes   => { '1m' => 0, '5m' => 0, '15m' => 0 },
     };
 
-    $self->_attach_multi_tf_volume( $level, $swing, $market_data ) if $market_data;
+    $self->_attach_multi_tf_volume( $level, $swing, $market_data )
+        if $market_data && $self->{track_volume};
 
     push @{ $self->{levels} }, $level;
     return $level;
@@ -421,68 +434,51 @@ sub _check_equal_levels {
 # MAQUINA DE ESTADOS: Detected -> Swept -> (Acceptance|Reclaimed) -> Resolved
 # =============================================================================
 
+# La logica de sweep (Detected->Swept) y de resolucion (Swept->Grab/Sweep/Run)
+# esta INLINE en el bucle por rendimiento: se evalua una vez por nivel abierto
+# y por vela (millones de veces en datasets grandes), y evitar el coste de la
+# llamada a metodo por iteracion reduce drasticamente el tiempo de rebuild
+# (arranque de la app y entrada/salida de replay). El comportamiento es
+# identico al de los antiguos _check_sweep/_check_resolution.
 sub _update_state_machine {
     my ( $self, $market_data, $i ) = @_;
     my $candle = $market_data->get_candle($i);
     return unless $candle;
 
+    my $ch = $candle->{high};
+    my $cl = $candle->{low};
+    my $cc = $candle->{close};
+    my $gw = $self->{grab_window};
+    my $an = $self->{acceptance_n};
+
     my @still_open;
     for my $level ( @{ $self->{_open_level_refs} } ) {
+        my $buy = ( $level->{side} eq 'buy' );
+        my $price = $level->{price};
+
+        # Detected -> Swept
         if ( $level->{state} eq 'DETECTED' ) {
-            $self->_check_sweep( $level, $candle, $i );
+            if ( $buy ? ( $ch > $price ) : ( $cl < $price ) ) {
+                $level->{state}          = 'SWEPT';
+                $level->{swept_at_index} = $i;
+            }
         }
+
+        # Swept -> Grab / Sweep / Run
         if ( $level->{state} eq 'SWEPT' ) {
-            $self->_check_resolution( $level, $candle, $i );
+            my $n_since = $i - $level->{swept_at_index} + 1;
+            my $inside  = $buy ? ( $cc <= $price ) : ( $cc >= $price );
+            if ($inside) {
+                $self->_resolve( $level,
+                    ( $n_since <= $gw ? 'GRAB' : 'SWEEP' ), $i );
+            } elsif ( $n_since >= $an ) {
+                $self->_resolve( $level, 'RUN', $i );
+            }
         }
+
         push @still_open, $level unless $level->{state} eq 'RESOLVED';
     }
     $self->{_open_level_refs} = \@still_open;
-}
-
-# -----------------------------------------------------------------------------
-# _check_sweep (privado) -- Estado 1 (Detected) -> Estado 2 (Swept)
-# BSL ('buy'): High > price.  SSL ('sell'): Low < price.
-# -----------------------------------------------------------------------------
-sub _check_sweep {
-    my ( $self, $level, $candle, $i ) = @_;
-
-    my $swept =
-        ( $level->{side} eq 'buy' )
-      ? ( $candle->{high} > $level->{price} )
-      : ( $candle->{low}  < $level->{price} );
-    return unless $swept;
-
-    $level->{state}          = 'SWEPT';
-    $level->{swept_at_index} = $i;
-}
-
-# -----------------------------------------------------------------------------
-# _check_resolution (privado) -- Estado 2 (Swept) -> Estado 5 (Resolved)
-# n_since incluye la propia vela del sweep (n_since=1 en esa misma vela).
-# -----------------------------------------------------------------------------
-sub _check_resolution {
-    my ( $self, $level, $candle, $i ) = @_;
-
-    my $n_since = $i - $level->{swept_at_index} + 1;
-
-    my $closed_inside =
-        ( $level->{side} eq 'buy' )
-      ? ( $candle->{close} <= $level->{price} )
-      : ( $candle->{close} >= $level->{price} );
-
-    if ($closed_inside) {
-        my $classification =
-            ( $n_since <= $self->{grab_window} ) ? 'GRAB' : 'SWEEP';
-        $self->_resolve( $level, $classification, $i );
-        return;
-    }
-
-    if ( $n_since >= $self->{acceptance_n} ) {
-        $self->_resolve( $level, 'RUN', $i );
-        return;
-    }
-
-    # Sigue abierto (Swept), esperando resolucion en velas siguientes.
 }
 
 # -----------------------------------------------------------------------------

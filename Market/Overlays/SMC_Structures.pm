@@ -59,36 +59,74 @@ sub set_flag {
 }
 
 sub render {
-    my ($self, $canvas, $scale) = @_;
+    my ($self, $canvas, $scale, $placer) = @_;
     $canvas->delete(TAG);
     my $src = $self->{source} or return;
 
-    my @placed;
-    $self->_render_fvgs($canvas, $scale, $src, \@placed)   if $self->{show_fvg};
-    $self->_render_obs($canvas, $scale, $src, \@placed)    if $self->{show_obs};
-    $self->_render_struct($canvas, $scale, $src, \@placed) if $self->{show_struct};
-    $self->_render_events($canvas, $scale, $src, \@placed)
+    # $placer (opcional): las etiquetas se ENCOLAN en el LabelPlacer compartido
+    # y ChartEngine las coloca al final evitando velas y otras etiquetas. Si no
+    # se pasa placer, se cae al chip inmediato de siempre (compatibilidad).
+    $self->_render_fvgs($canvas, $scale, $src, $placer)   if $self->{show_fvg};
+    $self->_render_obs($canvas, $scale, $src, $placer)    if $self->{show_obs};
+    $self->_render_struct($canvas, $scale, $src, $placer) if $self->{show_struct};
+    $self->_render_events($canvas, $scale, $src, $placer)
         if $self->{show_bos} || $self->{show_choch};
+}
+
+# _label: encola una etiqueta en el placer (anti-solape global) o, si no hay
+# placer, la dibuja inmediatamente con el chip clasico.
+sub _label {
+    my ($self, $placer, $canvas, $x, $y, $text, %o) = @_;
+    if ($placer) {
+        $placer->add(
+            x => $x, y => $y, text => $text,
+            color => $o{color}, style => $o{style}, side => $o{side},
+            priority => $o{priority}, hideable => $o{hideable}, font => $o{font},
+        );
+    } else {
+        $self->_chip($canvas, $x, $y, $text,
+            -color => $o{color}, -style => $o{style},
+            -place => $o{side}, -font => $o{font});
+    }
 }
 
 # =============================================================================
 # HH / HL / LH / LL  +  zigzag
 # =============================================================================
 sub _render_struct {
-    my ($self, $canvas, $scale, $src, $placed) = @_;
+    my ($self, $canvas, $scale, $src, $placer) = @_;
     my $swings = $src->get_struct_swings or return;
     return unless @$swings;
 
     my $off = $scale->{offset};
     my $vb  = $scale->{visible_bars};
 
-    # --- Linea zigzag que conecta pivotes visibles ---
+    # --- Linea zigzag ESTRUCTURA MAYOR: se dibuja con la version compactada
+    # (get_main_struct), que une directamente el origen con el extremo principal
+    # de cada tramo fuerte (LL -> HH directo, sin zigzaguear por los pivotes
+    # internos). Las etiquetas y puntos de abajo siguen usando los pivotes
+    # crudos (get_struct_swings), asi que el detalle HH/HL/LH/LL no se pierde.
+    my $main = $src->can('get_main_struct') ? $src->get_main_struct : $swings;
+    # Se incluye el pivote inmediatamente ANTERIOR y POSTERIOR a la ventana para
+    # que las piernas largas (compactadas) que la cruzan se dibujen completas.
+    # value_to_y_raw (recortado a +-10000) evita que un pivote fuera de rango
+    # vertical rompa la polilinea; Tk recorta el resto.
+    my ($lo, $hi) = ($off - 1, $off + $vb + 1);
     my @pts;
-    for my $sw (@$swings) {
-        next if $sw->{index} < $off - 1 || $sw->{index} > $off + $vb + 1;
-        next unless $scale->value_in_range($sw->{price});
-        push @pts, $scale->index_to_center_x($sw->{index}),
-                   $scale->value_to_y($sw->{price});
+    my $prev;
+    for my $sw (@$main) {
+        my $xy = sub { ( $scale->index_to_center_x($sw->{index}),
+                         $scale->value_to_y_raw($sw->{price}) ) };
+        if ($sw->{index} < $lo) { $prev = $sw; next; }
+        if ($sw->{index} > $hi) {
+            if ($prev) { push @pts, $scale->index_to_center_x($prev->{index}),
+                                     $scale->value_to_y_raw($prev->{price}); $prev = undef; }
+            push @pts, $xy->();
+            last;
+        }
+        if ($prev) { push @pts, $scale->index_to_center_x($prev->{index}),
+                                 $scale->value_to_y_raw($prev->{price}); $prev = undef; }
+        push @pts, $xy->();
     }
     if (@pts >= 4) {
         $canvas->createLine(@pts,
@@ -121,13 +159,11 @@ sub _render_struct {
         next if $too_close;
         push @$slot, $x;
 
-        $self->_chip($canvas, $x, $y, $sw->{label},
-            -color  => $color,
-            -style  => 'outline',
-            -place  => ($up ? 'above' : 'below'),
-            -offset => 10,
-            -font   => 'TkDefaultFont 7 bold',
-            -placed => $placed);
+        $self->_label($placer, $canvas, $x, $y, $sw->{label},
+            color => $color, style => 'outline',
+            side  => ($up ? 'above' : 'below'),
+            priority => 5, hideable => 1,
+            font => 'TkDefaultFont 7 bold');
     }
 }
 
@@ -137,7 +173,7 @@ sub _render_struct {
 # Si el area tambien tiene un OB activo, muestra chip "OB" en lugar de "FVG".
 # =============================================================================
 sub _render_fvgs {
-    my ($self, $canvas, $scale, $src, $placed) = @_;
+    my ($self, $canvas, $scale, $src, $placer) = @_;
     my $fvgs = $src->get_fvgs or return;
     my $last_known = $src->processed_last;
     my $max_age    = $self->{max_age};
@@ -154,23 +190,35 @@ sub _render_fvgs {
 
     for my $f (@$fvgs) {
         next unless $f->{significant};
-        next if $f->{state} eq 'expired';
+        # Solo se dibujan FVG ACTIVOS: al mitigarse (consumo completo) o expirar
+        # desaparecen (spec 13.5). El encogimiento progresivo se hace con la
+        # frontera consumed_to que mantiene el indicador.
+        next if $f->{state} ne 'active';
 
         my $age = $last_known - $f->{created};
         next if $age > $max_age;
 
-        # Borde derecho
-        my $right_idx = ($f->{state} eq 'mitigated' && defined $f->{mitig_at})
-            ? $f->{mitig_at}
-            : $f->{created} + $max_age;
-        $right_idx = $last_known if $right_idx > $last_known;
+        # Zona RESTANTE (no consumida): se encoge conforme el precio penetra.
+        my $ct = $f->{consumed_to};
+        my ($rem_top, $rem_bottom);
+        if ($f->{dir} eq 'bull') {
+            $rem_top    = defined $ct ? $ct : $f->{top};
+            $rem_bottom = $f->{bottom};
+        } else {
+            $rem_top    = $f->{top};
+            $rem_bottom = defined $ct ? $ct : $f->{bottom};
+        }
+        next if ($rem_top - $rem_bottom) <= 0;   # ya consumido
 
+        # Borde derecho
+        my $right_idx = $f->{created} + $max_age;
+        $right_idx = $last_known if $right_idx > $last_known;
         next if $right_idx < $off;
         next if $f->{idx_create} > $off + $vb;
 
-        next unless $scale->value_in_range($f->{top})
-                 || $scale->value_in_range($f->{bottom})
-                 || ($f->{bottom} < $scale->{min_val} && $f->{top} > $scale->{max_val});
+        next unless $scale->value_in_range($rem_top)
+                 || $scale->value_in_range($rem_bottom)
+                 || ($rem_bottom < $scale->{min_val} && $rem_top > $scale->{max_val});
 
         # Borde izquierdo: DESPUES de la 3a vela (idx_create)
         my $x1 = $scale->index_to_center_x($f->{idx_create}) + $bar_w * 0.5;
@@ -179,57 +227,42 @@ sub _render_fvgs {
         $x2 = $plot_w if $x2 > $plot_w;
         next if $x2 <= $x1;
 
-        my $yt = $scale->value_to_y($f->{top});
-        my $yb = $scale->value_to_y($f->{bottom});
+        my $yt = $scale->value_to_y($rem_top);
+        my $yb = $scale->value_to_y($rem_bottom);
         next if $yb - $yt < 2;   # zona demasiado delgada en pixels, omitir
+
+        # PRIORIDAD OB > FVG (spec 15): si un OB activo comparte esta banda de
+        # precio, NO se dibuja el FVG (el OB domina visualmente esa zona).
+        my $under_ob = 0;
+        for my $ob (@active_obs) {
+            my $ob_yt = $scale->value_to_y($ob->{zone_high});
+            my $ob_yb = $scale->value_to_y($ob->{zone_low});
+            next if $ob_yb < $yt || $ob_yt > $yb;   # sin overlap vertical
+            $under_ob = 1; last;
+        }
+        next if $under_ob;
 
         # Desvanecimiento por edad
         my $fresh = 1 - ($age / $max_age);
         $fresh = 0 if $fresh < 0;
 
-        # Consumo parcial (cuanto del FVG ha penetrado el precio actual)
-        my $consumed = 0;
-        my $range    = $f->{top} - $f->{bottom};
-        if ($range > 0) {
-            if ($f->{dir} eq 'bull' && $last_close < $f->{top}) {
-                $consumed = ($f->{top} - ($last_close > $f->{bottom} ? $last_close : $f->{bottom})) / $range;
-            } elsif ($f->{dir} eq 'bear' && $last_close > $f->{bottom}) {
-                $consumed = (($last_close < $f->{top} ? $last_close : $f->{top}) - $f->{bottom}) / $range;
-            }
-            $consumed = 0 if $consumed < 0;
-            $consumed = 1 if $consumed > 1;
-        }
-        next if $consumed >= 0.99 && $f->{state} eq 'active';  # completamente consumido
-
-        my $visibility = $fresh * (1 - $consumed * 0.6);
         my $base = ($f->{dir} eq 'bull') ? '#26a69a' : '#ef5350';
-        my $fill_op = 0.05 + 0.12 * $visibility;
-        $fill_op *= 0.50 if $f->{state} eq 'mitigated';
-        my $fill = _mix($base, $fill_op);
+        my $fill = _mix($base, 0.05 + 0.10 * $fresh);
         my $line = _mix($base, 0.25 + 0.25 * $fresh);
 
         $canvas->createRectangle($x1, $yt, $x2, $yb,
             -fill => $fill, -outline => $line, -width => 1, -tags => [TAG, TAG_FVG]);
 
-        # Chip: si hay OB activo en la misma zona, muestra "OB" en vez de "FVG"
+        # Chip "FVG" (solo si la caja restante es suficientemente alta y no muy
+        # vieja). Las zonas con OB ya se saltaron arriba, asi que aqui siempre
+        # es FVG puro.
         if (($yb - $yt) >= 14 && $age <= int($max_age * 0.6)) {
-            my $has_ob_here = 0;
-            for my $ob (@active_obs) {
-                my $ob_yt = $scale->value_to_y($ob->{zone_high});
-                my $ob_yb = $scale->value_to_y($ob->{zone_low});
-                next if $ob_yb < $yt || $ob_yt > $yb;  # no hay overlap vertical
-                $has_ob_here = 1;
-                last;
-            }
-            my $chip_txt = $has_ob_here ? 'OB' : 'FVG';
             my $cx = ($x1 + $x2) / 2;
             $cx = 24 if $cx < 24;
-            $self->_chip($canvas, $cx, ($yt + $yb) / 2, $chip_txt,
-                -color  => $base,
-                -style  => 'outline',
-                -place  => 'center',
-                -font   => 'TkDefaultFont 6 bold',
-                -placed => $placed);
+            $self->_label($placer, $canvas, $cx, ($yt + $yb) / 2, 'FVG',
+                color => $base, style => 'outline', side => 'center',
+                priority => 7, hideable => 1,
+                font => 'TkDefaultFont 6 bold');
         }
     }
 }
@@ -239,7 +272,7 @@ sub _render_fvgs {
 # cerca (dentro de ob_proximity_mult * ATR). Soporte abajo, resistencia arriba.
 # =============================================================================
 sub _render_obs {
-    my ($self, $canvas, $scale, $src, $placed) = @_;
+    my ($self, $canvas, $scale, $src, $placer) = @_;
     my $obs = $src->get_order_blocks or return;
     return unless @$obs;
 
@@ -287,15 +320,13 @@ sub _render_obs {
             -dash    => [4, 3],
             -tags    => [TAG, TAG_OB]);
 
-        # Etiqueta "OB" en el lado izquierdo de la zona
+        # Etiqueta "OB" en el lado izquierdo de la zona (maxima prioridad)
         my $cy = ($yt + $yb) / 2;
         my $label = ($ob->{dir} eq 'bull') ? 'OB+' : 'OB-';
-        $self->_chip($canvas, $x1 + 20, $cy, $label,
-            -color  => $color,
-            -style  => 'solid',
-            -place  => 'center',
-            -font   => 'TkDefaultFont 7 bold',
-            -placed => $placed);
+        $self->_label($placer, $canvas, $x1 + 20, $cy, $label,
+            color => $color, style => 'solid', side => 'center',
+            priority => 1, hideable => 0,
+            font => 'TkDefaultFont 7 bold');
     }
 }
 
@@ -306,7 +337,7 @@ sub _render_obs {
 #   CHoCH up  = azul   | CHoCH down = naranja
 # =============================================================================
 sub _render_events {
-    my ($self, $canvas, $scale, $src, $placed) = @_;
+    my ($self, $canvas, $scale, $src, $placer) = @_;
     my $events = $src->get_events or return;
 
     my $off    = $scale->{offset};
@@ -346,11 +377,11 @@ sub _render_events {
             -tags  => [TAG]);
 
         my $up = ($e->{dir} eq 'up');
-        $self->_chip($canvas, ($x1 + $x2) / 2, $y, $e->{label},
-            -color  => $color,
-            -style  => 'solid',
-            -place  => ($up ? 'above' : 'below'),
-            -placed => $placed);
+        $self->_label($placer, $canvas, ($x1 + $x2) / 2, $y, $e->{label},
+            color => $color, style => 'solid',
+            side  => ($up ? 'above' : 'below'),
+            priority => 2, hideable => 0,
+            font => 'TkDefaultFont 8 bold');
     }
 }
 

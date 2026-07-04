@@ -233,14 +233,29 @@ sub _auto_pause_if_at_end {
 sub exit_replay {
     my ($self) = @_;
     $self->_cancel_tick;   # detener cualquier tick pendiente antes de salir
+
+    # OPTIMIZACION (spec 17): al salir NO se reconstruye todo desde cero. El
+    # estado de los indicadores ya es valido para 0..puntero_actual; solo faltan
+    # las velas puntero+1..final. Se alimentan INCREMENTALMENTE (igual que un
+    # step_forward hasta el final) y luego se limpia la frontera. Esto evita el
+    # reset_all + rebuild_all completo (varios segundos en datasets grandes).
+    my $market = $self->{market};
+    if ( $self->{_active} && $self->{indicators} ) {
+        my $raw_last = $market->raw_last_index;
+        my $cur_idx  = $market->last_index;
+        for my $idx ( ( $cur_idx + 1 ) .. $raw_last ) {
+            my $c = $market->raw_get_candle($idx);
+            $market->set_replay_boundary( $c->{ts} );
+            $self->{indicators}->update_last($market);
+        }
+    }
+
     $self->{_playing} = 0;
     $self->{_active}  = 0;
     $self->{_fast}    = 0;
     $self->{_ts}      = undef;
 
-    $self->{market}->clear_replay_boundary;
-    $self->_full_rebuild;
-
+    $market->clear_replay_boundary;
     $self->_notify;
 }
 

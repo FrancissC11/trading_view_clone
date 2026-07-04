@@ -23,6 +23,11 @@ sub new {
         # aun mas limpia; bajarlo => mas detalle. structure_atr_factor del PDF.
         struct_atr_mult    => $args{struct_atr_mult}   // 2.5,
         struct_min_bars    => $args{struct_min_bars}   // 3,
+        # Umbral de retroceso para la LINEA compactada (get_main_struct): un
+        # pivote interno se colapsa solo si su retroceso es < main_retrace de la
+        # pierna previa. Mas bajo = mas agresivo (linea mas recta); mas alto =
+        # conserva mas detalle.
+        main_retrace       => $args{main_retrace}      // 0.7,
 
         _c            => [],
         _fvgs         => [],
@@ -52,6 +57,59 @@ sub get_fvgs          { return $_[0]->{_fvgs}; }
 sub get_events        { return $_[0]->{_events}; }
 sub get_struct_swings { return $_[0]->{_struct_swings}; }
 sub get_order_blocks  { return $_[0]->{_order_blocks}; }
+
+# -----------------------------------------------------------------------------
+# get_main_struct: version COMPACTADA de _struct_swings para dibujar la LINEA
+# principal. Colapsa los pivotes internos de un tramo fuerte (spec 5/7):
+# mientras la tendencia sigue extendiendose (highs cada vez mas altos con lows
+# cada vez mas altos -- o lows mas bajos con highs mas bajos), los pivotes
+# intermedios se absorben y la linea une DIRECTAMENTE el origen con el extremo
+# principal (p.ej. LL -> HH directo, sin el HH/HL interno).
+#
+# Es un derivado de solo lectura: NO altera _struct_swings (que conserva el
+# detalle para BOS/CHoCH) ni las etiquetas HH/HL/LH/LL (que se siguen mostrando
+# sobre TODOS los pivotes crudos). Sin fuga de futuro: solo usa pivotes ya
+# confirmados. O(n) por llamada (n = pivotes estructurales), se calcula al
+# renderizar.
+# -----------------------------------------------------------------------------
+sub get_main_struct {
+    my ($self) = @_;
+    my $raw = $self->{_struct_swings};
+    # Fraccion de retroceso por debajo de la cual un pivote interno se considera
+    # RUIDO de un impulso y se colapsa. Un retroceso PROFUNDO (>= este umbral
+    # respecto a la pierna previa) SI es estructura y se conserva -> asi NO se
+    # aplasta una tendencia sana en escalera, solo los wiggles internos poco
+    # profundos (spec 5/7). Tunable via main_retrace.
+    my $ret = $self->{main_retrace};
+    my @m;
+    for my $p (@$raw) {
+        while (@m >= 3) {
+            my ($A, $B, $C) = @m[-3, -2, -1];
+            last unless $B->{kind} eq $p->{kind};   # alternancia (seguridad)
+
+            # Continuacion: el nuevo pivote extiende el impulso mas alla de B.
+            my $cont = ($p->{kind} eq 'H')
+                ? ( $p->{price} >= $B->{price} )
+                : ( $p->{price} <= $B->{price} );
+            last unless $cont;
+
+            # El retroceso interno (B->C) se mide contra la PIERNA previa (A->B).
+            # Si el retroceso es < main_retrace de esa pierna, el pivote interno
+            # es un wiggle del impulso y se colapsa (la linea une A->P directo,
+            # LL->HH). Un retroceso profundo (>= umbral) SI es estructura y se
+            # conserva -> no aplasta una escalera con pullbacks fuertes. Este
+            # criterio (pierna previa) es estable y gradual; el de "impulso
+            # completo" era demasiado sensible.
+            my $pull = abs( $B->{price} - $C->{price} );
+            my $leg  = abs( $B->{price} - $A->{price} );
+            last unless ( $leg > 0 && $pull < $ret * $leg );
+
+            pop @m; pop @m;   # quitar los 2 pivotes internos (B y C)
+        }
+        push @m, $p;
+    }
+    return \@m;
+}
 sub processed_last    { return $#{ $_[0]->{_c} }; }
 
 sub reset {
@@ -291,6 +349,11 @@ sub _detect_fvg {
         top         => $top,
         state       => 'active',
         mitig_at    => undef,
+        # Frontera de la zona AUN NO consumida (consumo progresivo, spec 13.5):
+        #  - bull: arranca en top y baja hacia bottom conforme el precio entra;
+        #          zona restante = [bottom, consumed_to].
+        #  - bear: arranca en bottom y sube hacia top; restante = [consumed_to, top].
+        consumed_to => ($dir eq 'bull' ? $top : $bottom),
         significant => (($top - $bottom) >= $min_sz),
     };
     push @{ $self->{_fvgs} }, $fvg;
@@ -308,8 +371,16 @@ sub _update_fvgs {
         # consumidos no desaparecian (spec 17). Ahora se mantiene y se evalua
         # desde la vela siguiente.
         if ($i <= $f->{created}) { push @keep, $f; next; }
-        if ($f->{dir} eq 'bull' && $cur->{low} <= $f->{bottom})  { $f->{state}='mitigated'; $f->{mitig_at}=$i; next; }
-        if ($f->{dir} eq 'bear' && $cur->{high} >= $f->{top})    { $f->{state}='mitigated'; $f->{mitig_at}=$i; next; }
+
+        # Consumo progresivo: avanzar la frontera consumed_to segun cuanto
+        # penetro el precio en la zona; mitigar (desaparecer) al cubrirla toda.
+        if ($f->{dir} eq 'bull') {
+            $f->{consumed_to} = $cur->{low} if $cur->{low} < $f->{consumed_to};
+            if ($cur->{low} <= $f->{bottom}) { $f->{state}='mitigated'; $f->{mitig_at}=$i; next; }
+        } else {
+            $f->{consumed_to} = $cur->{high} if $cur->{high} > $f->{consumed_to};
+            if ($cur->{high} >= $f->{top}) { $f->{state}='mitigated'; $f->{mitig_at}=$i; next; }
+        }
         if (($i - $f->{created}) > $self->{max_age})             { $f->{state}='expired';   next; }
         push @keep, $f;
     }

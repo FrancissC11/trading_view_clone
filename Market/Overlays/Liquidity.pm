@@ -66,17 +66,34 @@ sub set_flag {
 }
 
 sub render {
-    my ( $self, $canvas, $scale ) = @_;
+    my ( $self, $canvas, $scale, $placer ) = @_;
     $canvas->delete(TAG);
     my $src = $self->{source};
     return unless $src;
 
-    my @placed;   # cajas [x1,y1,x2,y2] de etiquetas ya colocadas (anti-solape)
+    # $placer (opcional): las etiquetas se encolan en el LabelPlacer compartido
+    # (anti-solape global contra velas y demas etiquetas). Sin placer, cae al
+    # chip inmediato clasico.
     $self->_render_swings( $canvas, $scale, $src )            if $self->{show_swing};
-    $self->_render_levels( $canvas, $scale, $src, \@placed );
-    $self->_render_equals( $canvas, $scale, $src, \@placed )
+    $self->_render_levels( $canvas, $scale, $src, $placer );
+    $self->_render_equals( $canvas, $scale, $src, $placer )
         if $self->{show_eqh} || $self->{show_eql};
-    $self->_render_events( $canvas, $scale, $src, \@placed );
+    $self->_render_events( $canvas, $scale, $src, $placer );
+}
+
+# _label: encola en el placer o cae al chip inmediato (compatibilidad).
+sub _label {
+    my ($self, $placer, $canvas, $x, $y, $text, %o) = @_;
+    if ($placer) {
+        $placer->add(
+            x => $x, y => $y, text => $text,
+            color => $o{color}, style => $o{style}, side => $o{side},
+            priority => $o{priority}, hideable => $o{hideable}, font => $o{font},
+        );
+    } else {
+        $self->_chip($canvas, $x, $y, $text,
+            -color => $o{color}, -style => $o{style}, -place => $o{side});
+    }
 }
 
 # -----------------------------------------------------------------------------
@@ -84,7 +101,7 @@ sub render {
 # extiende a la derecha; chip outline "BSL"/"SSL" junto a la regleta de precio.
 # -----------------------------------------------------------------------------
 sub _render_levels {
-    my ( $self, $canvas, $scale, $src, $placed ) = @_;
+    my ( $self, $canvas, $scale, $src, $placer ) = @_;
     my $levels = $src->get_levels or return;
 
     my $off    = $scale->{offset};
@@ -117,9 +134,9 @@ sub _render_levels {
                 $x1, $y, $plot_w, $y,
                 -fill => $color, -dash => [ 2, 3 ], -width => 1, -tags => [TAG] );
 
-            $self->_chip( $canvas, $plot_w - 20, $y, $text,
-                -color => $color, -style => 'outline', -place => 'center',
-                -placed => $placed );
+            $self->_label( $placer, $canvas, $plot_w - 20, $y, $text,
+                color => $color, style => 'outline', side => 'center',
+                priority => 5, hideable => 1 );
         }
     }
 }
@@ -156,7 +173,7 @@ sub _render_swings {
 # EQH / EQL: linea punteada que conecta ambos pivotes iguales + chip outline.
 # -----------------------------------------------------------------------------
 sub _render_equals {
-    my ( $self, $canvas, $scale, $src, $placed ) = @_;
+    my ( $self, $canvas, $scale, $src, $placer ) = @_;
     my $eqs = $src->get_equals or return;
 
     my $off = $scale->{offset};
@@ -179,9 +196,10 @@ sub _render_equals {
         $canvas->createLine( $x1, $y1, $x2, $y2,
             -fill => C_EQ, -width => 1, -dash => [ 4, 2 ], -tags => [TAG] );
 
-        $self->_chip( $canvas, ( $x1 + $x2 ) / 2, ( $y1 + $y2 ) / 2, $e->{kind},
-            -color => C_EQ, -style => 'outline',
-            -place => ( $is_high ? 'above' : 'below' ), -placed => $placed );
+        $self->_label( $placer, $canvas, ( $x1 + $x2 ) / 2, ( $y1 + $y2 ) / 2, $e->{kind},
+            color => C_EQ, style => 'outline',
+            side  => ( $is_high ? 'above' : 'below' ),
+            priority => 6, hideable => 1 );
     }
 }
 
@@ -190,7 +208,7 @@ sub _render_equals {
 # (anti-solape, prioriza los mas recientes).
 # -----------------------------------------------------------------------------
 sub _render_events {
-    my ( $self, $canvas, $scale, $src, $placed ) = @_;
+    my ( $self, $canvas, $scale, $src, $placer ) = @_;
     my $events = $src->get_events or return;
 
     my $off = $scale->{offset};
@@ -240,9 +258,12 @@ sub _render_events {
         $canvas->createOval( $x - 3, $y - 3, $x + 3, $y + 3,
             -fill => $color, -outline => $color, -tags => [TAG] );
 
-        $self->_chip( $canvas, $x, $y + $dy, $ev->{label},
-            -color => $color, -style => 'solid',
-            -place => ( $up ? 'above' : 'below' ), -placed => $placed );
+        # LQ RUN mas prioritario que Sweep/Grab (spec 8).
+        my $prio = ( $t eq 'RUN' ) ? 3 : 4;
+        $self->_label( $placer, $canvas, $x, $y + $dy, $ev->{label},
+            color => $color, style => 'solid',
+            side  => ( $up ? 'above' : 'below' ),
+            priority => $prio, hideable => 1 );
     }
 }
 

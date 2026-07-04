@@ -4,6 +4,7 @@ use strict;
 use warnings;
 use POSIX qw(floor);
 use Market::Panels::Scales;
+use Market::Overlays::LabelPlacer;
 
 use constant {
     MIN_BARS       => 2,
@@ -154,6 +155,14 @@ sub set_replay_start_marker {
     my ( $self, $index, $label ) = @_;
     $self->{_replay_start_index} = $index;
     $self->{_replay_start_label} = $label;
+
+    # Encuadre (spec 18): la vela de inicio queda al borde IZQUIERDO, con un
+    # pequeno margen, y el espacio a la derecha se ira llenando conforme avanza
+    # el replay. follow_replay_pointer respeta este offset mientras el puntero
+    # siga dentro de la ventana (solo hace scroll cuando se sale por la derecha).
+    my $pad = 3;
+    $self->{offset} = $index - $pad;
+
     $self->request_render;
 }
 
@@ -383,8 +392,34 @@ sub render {
     # construido arriba -- nunca crean una escala propia. $self->{overlays}
     # es opcional para no romper compatibilidad si algun consumidor de
     # ChartEngine no lo provee.
-    $self->{overlays}->render_all( $self->{canvas_price}, $scale_price )
-        if $self->{overlays};
+    #
+    # Anti-solape de etiquetas: se crea un LabelPlacer sembrado con las cajas
+    # (cuerpo+mecha) de las velas visibles como OBSTACULOS. Los overlays encolan
+    # sus etiquetas en el placer en vez de dibujarlas al vuelo; al final se
+    # llama flush() para colocarlas evitando velas y otras etiquetas, por orden
+    # de prioridad. Se borran las etiquetas del frame anterior antes de encolar.
+    $self->{canvas_price}->delete('labels');
+    my $placer;
+    if ( $self->{overlays} ) {
+        my $bar_w = $scale_price->_plot_w / $scale_price->{visible_bars};
+        my $hw    = $bar_w / 2 + 1;
+        my @obst;
+        my $gi = $islice_start;
+        for my $c (@$visible_candles) {
+            my $cx = $scale_price->index_to_center_x($gi);
+            push @obst, [
+                $cx - $hw, $scale_price->value_to_y( $c->{high} ),
+                $cx + $hw, $scale_price->value_to_y( $c->{low} ),
+            ];
+            $gi++;
+        }
+        $placer = Market::Overlays::LabelPlacer->new(
+            obstacles => \@obst,
+            plot_w    => $scale_price->_plot_w,
+            plot_h    => $canv_ph,
+        );
+        $self->{overlays}->render_all( $self->{canvas_price}, $scale_price, $placer );
+    }
 
     # Z-order: las ZONAS de FVG y OB deben quedar DETRAS de las velas (no
     # taparlas). Los overlays se dibujan despues de las velas, asi que aqui se
@@ -399,6 +434,10 @@ sub render {
         eval { $cpz->lower( 'smc_fvg_zone', 'candle' ) };
         eval { $cpz->lower( 'smc_ob_zone',  'candle' ) };
     }
+
+    # Colocar TODAS las etiquetas encoladas (por encima de velas/lineas),
+    # resolviendo colisiones contra velas y entre si segun prioridad.
+    $placer->flush( $self->{canvas_price}, 'labels' ) if $placer;
 
     $self->{price_panel}->render_last_visible_price( $self->{canvas_price} );
 
@@ -1334,7 +1373,27 @@ sub follow_replay_pointer {
     my $total = $self->{market}->size;
     return if $total <= 0;
 
-    $self->{offset} = $total - $self->{visible_bars};
+    my $ptr        = $total - 1;                       # ultima vela del replay
+    my $bars       = $self->{visible_bars};
+    my $right_edge = $self->{offset} + $bars - 1;
+
+    # Politica de encuadre tipo TradingView:
+    #  - Al ARRANCAR (o retroceder), el puntero cae a la IZQUIERDA de la ventana
+    #    actual -> se reencuadra con el puntero al borde izquierdo y espacio
+    #    vacio a la derecha que se ira llenando al avanzar (spec 18).
+    #  - Mientras el puntero avanza DENTRO de la ventana, el offset NO se toca
+    #    (la vela seleccionada se mantiene a la izquierda y el grafico se llena
+    #    hacia la derecha).
+    #  - Cuando el puntero se sale por la DERECHA, recien ahi se hace scroll
+    #    para mantenerlo a la vista.
+    if ( $ptr < $self->{offset} ) {
+        $self->{offset} = $ptr;                        # puntero al borde izquierdo
+    }
+    elsif ( $ptr > $right_edge ) {
+        $self->{offset} = $ptr - ( $bars - 1 );        # puntero al borde derecho
+    }
+    # else: dentro de la ventana -> no mover (se llena hacia la derecha).
+
     $self->request_render;
 }
 

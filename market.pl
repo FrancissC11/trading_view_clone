@@ -171,7 +171,13 @@ my $smc_ind = Market::Indicators::SMC_Structures->new(
     # linea estructural mayor. Mas alto = linea mas limpia (menos picos
     # internos). Rango util aprox 1.5 (mas detalle) .. 3.5 (solo tramos
     # grandes). Ajustar aqui si el profesor quiere mas/menos estructura.
-    struct_atr_mult => 2.5 );
+    struct_atr_mult => 2.5,
+    # main_retrace: compactacion de la LINEA principal. Un pivote interno se
+    # colapsa (la linea va DIRECTA origen->extremo, LL->HH) si su retroceso es
+    # < esta fraccion de la PIERNA PREVIA. Mas ALTO = linea mas recta (colapsa
+    # retrocesos mas profundos); mas bajo = conserva mas escalones. 0.7 colapsa
+    # wiggles internos de hasta ~70% de retroceso (deja ~4 puntos por ventana).
+    main_retrace => 0.7 );
 
 $ind_manager->register('atr',       $atr_ind);
 $ind_manager->register('liquidity', $liq_ind);
