@@ -172,11 +172,16 @@ my $smc_ind = Market::Indicators::SMC_Structures->new(
     # internos). Rango util aprox 1.5 (mas detalle) .. 3.5 (solo tramos
     # grandes). Ajustar aqui si el profesor quiere mas/menos estructura.
     struct_atr_mult => 2.5,
-    # main_atr_mult: umbral (en ATR) de la reversion que confirma una pierna del
-    # zigzag EXTERNO (azul, estructura mayor). Une los swings mayores en
-    # alternancia sin colapsar en diagonales largas. Mas alto = linea mas gruesa
-    # (solo swings enormes); mas bajo = mas detalle. ~5 = swings mayores.
-    main_atr_mult => 5.0 );
+    # Zigzag EXTERNO (azul, estructura mayor):
+    #  - main_atr_mult: umbral (en ATR) de la reversion que confirma una pierna.
+    #    Mas alto = linea mas gruesa (solo swings enormes); mas bajo = mas detalle.
+    #  - main_dtop_atr: tolerancia de DOBLE-TECHO/PISO. Si dos extremos del mismo
+    #    lado estan a <= main_dtop_atr*ATR, el 2o es un retest y NO cuenta como
+    #    pierna nueva -> la estructura toma el lower-high/higher-low posterior
+    #    (estructura de mercado, como pidio el usuario). Subirlo fusiona mas
+    #    (riesgo de juntar swings reales); bajarlo solo junta techos casi iguales.
+    main_atr_mult => 3.5,
+    main_dtop_atr => 1.0 );
 
 $ind_manager->register('atr',       $atr_ind);
 $ind_manager->register('liquidity', $liq_ind);

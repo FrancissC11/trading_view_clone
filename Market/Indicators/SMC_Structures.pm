@@ -28,7 +28,13 @@ sub new {
         # reversion contra el ultimo pivote menor a main_atr_mult*ATR se ignora
         # (interna). Mas alto = linea externa mas gruesa/mayor; mas bajo = mas
         # detalle. Sustituye al antiguo main_retrace (colapso greedy).
-        main_atr_mult      => $args{main_atr_mult}     // 5.0,
+        main_atr_mult      => $args{main_atr_mult}     // 3.5,
+        # Tolerancia (en ATR) para detectar DOBLE-TECHO / DOBLE-PISO en el
+        # zigzag externo: si un nuevo extremo esta a <= main_dtop_atr*ATR del
+        # pivote previo del mismo lado, es un RETEST del mismo nivel y NO se
+        # cuenta como pierna nueva -> la estructura toma el lower-high /
+        # higher-low posterior (estructura de mercado, no pico geometrico).
+        main_dtop_atr      => $args{main_dtop_atr}     // 1.0,
 
         # Confirmacion por VOLUMEN de los pivotes estructurales (spec docente:
         # "considerar volatilidad Y volumen"). Un pivote nuevo se acepta si el
@@ -99,11 +105,14 @@ sub get_main_struct {
     # acumulada, que crece, y colapsaba swings mayores en una diagonal larga).
     my $atr_vals = $self->{atr} ? $self->{atr}->get_values : undef;
     my $mult     = $self->{main_atr_mult};
+    my $dt       = $self->{main_dtop_atr};
 
     my @m;
     for my $p (@$raw) {
         if (!@m) { push @m, $p; next; }
         my $last = $m[-1];
+        my $atr  = ($atr_vals && defined $atr_vals->[$p->{index}])
+                 ? $atr_vals->[$p->{index}] : 0;
 
         if ($p->{kind} eq $last->{kind}) {
             # misma pierna: conservar el extremo mas relevante
@@ -114,9 +123,19 @@ sub get_main_struct {
             next;
         }
 
+        # DOBLE-TECHO / DOBLE-PISO (estructura de mercado): si p esta casi al
+        # mismo nivel que el pivote previo del MISMO lado (@m[-2]), es un RETEST
+        # de ese nivel, no una pierna nueva. Se IGNORA p para que la estructura
+        # tome despues el lower-high / higher-low que confirma el giro (evita
+        # que un maximo/minimo marginal tape al swing estructural real).
+        if (@m >= 2) {
+            my $eqtol = $atr * $dt;
+            if ($eqtol > 0 && abs($p->{price} - $m[-2]->{price}) <= $eqtol) {
+                next;
+            }
+        }
+
         # lado opuesto: nueva pierna solo si la reversion es SIGNIFICATIVA
-        my $atr = ($atr_vals && defined $atr_vals->[$p->{index}])
-                ? $atr_vals->[$p->{index}] : 0;
         my $thr  = $atr * $mult;
         my $move = abs($p->{price} - $last->{price});
         push @m, $p if ($thr <= 0 || $move >= $thr);
