@@ -23,11 +23,12 @@ sub new {
         # aun mas limpia; bajarlo => mas detalle. structure_atr_factor del PDF.
         struct_atr_mult    => $args{struct_atr_mult}   // 2.5,
         struct_min_bars    => $args{struct_min_bars}   // 3,
-        # Umbral de retroceso para la LINEA compactada (get_main_struct): un
-        # pivote interno se colapsa solo si su retroceso es < main_retrace de la
-        # pierna previa. Mas bajo = mas agresivo (linea mas recta); mas alto =
-        # conserva mas detalle.
-        main_retrace       => $args{main_retrace}      // 0.7,
+        # Umbral (en ATR) de la REVERSION que confirma una nueva pierna del
+        # zigzag EXTERNO (get_main_struct / linea azul de estructura mayor). Una
+        # reversion contra el ultimo pivote menor a main_atr_mult*ATR se ignora
+        # (interna). Mas alto = linea externa mas gruesa/mayor; mas bajo = mas
+        # detalle. Sustituye al antiguo main_retrace (colapso greedy).
+        main_atr_mult      => $args{main_atr_mult}     // 5.0,
 
         _c            => [],
         _fvgs         => [],
@@ -75,38 +76,41 @@ sub get_order_blocks  { return $_[0]->{_order_blocks}; }
 sub get_main_struct {
     my ($self) = @_;
     my $raw = $self->{_struct_swings};
-    # Fraccion de retroceso por debajo de la cual un pivote interno se considera
-    # RUIDO de un impulso y se colapsa. Un retroceso PROFUNDO (>= este umbral
-    # respecto a la pierna previa) SI es estructura y se conserva -> asi NO se
-    # aplasta una tendencia sana en escalera, solo los wiggles internos poco
-    # profundos (spec 5/7). Tunable via main_retrace.
-    my $ret = $self->{main_retrace};
+    return [] unless @$raw;
+
+    # ZigZag por UMBRAL DE REVERSION (no colapso greedy). Reglas por pivote:
+    #  - Mismo lado que el ultimo pivote confirmado -> EXTIENDE el extremo
+    #    (se queda con el high mas alto / low mas bajo de la pierna en curso).
+    #  - Lado OPUESTO -> confirma una NUEVA pierna SOLO si el movimiento contra
+    #    el ultimo pivote supera main_atr_mult*ATR; si no, es una reversion
+    #    menor y se ignora (la pierna sigue extendiendose).
+    # Asi la linea externa une los swings MAYORES en alternancia sin aplastar
+    # una tendencia sana (el criterio greedy anterior comparaba contra la pierna
+    # acumulada, que crece, y colapsaba swings mayores en una diagonal larga).
+    my $atr_vals = $self->{atr} ? $self->{atr}->get_values : undef;
+    my $mult     = $self->{main_atr_mult};
+
     my @m;
     for my $p (@$raw) {
-        while (@m >= 3) {
-            my ($A, $B, $C) = @m[-3, -2, -1];
-            last unless $B->{kind} eq $p->{kind};   # alternancia (seguridad)
+        if (!@m) { push @m, $p; next; }
+        my $last = $m[-1];
 
-            # Continuacion: el nuevo pivote extiende el impulso mas alla de B.
-            my $cont = ($p->{kind} eq 'H')
-                ? ( $p->{price} >= $B->{price} )
-                : ( $p->{price} <= $B->{price} );
-            last unless $cont;
-
-            # El retroceso interno (B->C) se mide contra la PIERNA previa (A->B).
-            # Si el retroceso es < main_retrace de esa pierna, el pivote interno
-            # es un wiggle del impulso y se colapsa (la linea une A->P directo,
-            # LL->HH). Un retroceso profundo (>= umbral) SI es estructura y se
-            # conserva -> no aplasta una escalera con pullbacks fuertes. Este
-            # criterio (pierna previa) es estable y gradual; el de "impulso
-            # completo" era demasiado sensible.
-            my $pull = abs( $B->{price} - $C->{price} );
-            my $leg  = abs( $B->{price} - $A->{price} );
-            last unless ( $leg > 0 && $pull < $ret * $leg );
-
-            pop @m; pop @m;   # quitar los 2 pivotes internos (B y C)
+        if ($p->{kind} eq $last->{kind}) {
+            # misma pierna: conservar el extremo mas relevante
+            my $more = ($p->{kind} eq 'H')
+                ? ($p->{price} > $last->{price})
+                : ($p->{price} < $last->{price});
+            $m[-1] = $p if $more;
+            next;
         }
-        push @m, $p;
+
+        # lado opuesto: nueva pierna solo si la reversion es SIGNIFICATIVA
+        my $atr = ($atr_vals && defined $atr_vals->[$p->{index}])
+                ? $atr_vals->[$p->{index}] : 0;
+        my $thr  = $atr * $mult;
+        my $move = abs($p->{price} - $last->{price});
+        push @m, $p if ($thr <= 0 || $move >= $thr);
+        # si no supera el umbral, se ignora (reversion menor, interna)
     }
     return \@m;
 }
