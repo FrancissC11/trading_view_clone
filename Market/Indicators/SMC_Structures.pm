@@ -6,7 +6,7 @@ use warnings;
 sub new {
     my ($class, %args) = @_;
     my $self = {
-        liquidity          => $args{liquidity},
+        zigzag             => $args{zigzag},
         atr                => $args{atr},
         max_age            => $args{max_age}           // 50,
         min_fvg_atr_mult   => $args{min_fvg_atr_mult}  // 0.20,
@@ -19,11 +19,11 @@ sub new {
         _order_blocks => [],
         _active_obs   => [],
 
-        _struct_swings  => [],
-        _last_sh_price  => undef,
-        _last_sl_price  => undef,
-        _seen_sh_idx    => -1,
-        _seen_sl_idx    => -1,
+        _struct_swings      => [],
+        _last_sh_price      => undef,
+        _last_sl_price      => undef,
+        _seen_int_seg_count => 0,
+        _seen_ext_seg_count => 0,
         _last_hh => undef, _last_hl => undef,
         _last_lh => undef, _last_ll => undef,
 
@@ -52,11 +52,11 @@ sub reset {
     $self->{_events}       = [];
     $self->{_order_blocks} = [];
     $self->{_active_obs}   = [];
-    $self->{_struct_swings}  = [];
-    $self->{_last_sh_price}  = undef;
-    $self->{_last_sl_price}  = undef;
-    $self->{_seen_sh_idx}    = -1;
-    $self->{_seen_sl_idx}    = -1;
+    $self->{_struct_swings}      = [];
+    $self->{_last_sh_price}      = undef;
+    $self->{_last_sl_price}      = undef;
+    $self->{_seen_int_seg_count} = 0;
+    $self->{_seen_ext_seg_count} = 0;
     $self->{_last_hh} = $self->{_last_hl} = undef;
     $self->{_last_lh} = $self->{_last_ll} = undef;
     $self->{_bias}    = undef;
@@ -92,55 +92,105 @@ sub _process {
 }
 
 # -----------------------------------------------------------------------------
-# _update_swing_structure: clasifica nuevos swings como HH/HL/LH/LL
-# Compara cada nuevo swing high con el previo (HH si es mayor, LH si menor),
-# igual para lows (HL si mayor, LL si menor). Mantiene los 4 niveles
-# estructurales vigentes para que _detect_bos_choch use los correctos.
+# _update_swing_structure: clasifica nuevos swings como HH/HL/LH/LL a partir
+# del ZigZag (Indicators::ZigZag), no de Liquidity.
+#
+# DETALLE vs FILTRO (decision de diseno, evita el ruido de re-etiquetar
+# HH/LH o LL/HL en base a micro-pivotes):
+#   - El ZigZag INTERNO (30m, period=2) da el DETALLE: cada pivote suyo se
+#     emite como swing estructural (_struct_swings) y su label sale de
+#     compararlo contra el nivel de referencia vigente (_last_sh_price /
+#     _last_sl_price).
+#   - El ZigZag EXTERNO (Length=150 sobre la TF activa) actua como FILTRO:
+#     cuando confirma un pivote nuevo, "resetea" el nivel de referencia a
+#     ese extremo de mayor jerarquia (macro). Asi, una racha de pivotes
+#     internos que solo reflejan ruido de 30m queda anclada al ultimo
+#     extremo confirmado a escala mayor en vez de arrastrar una referencia
+#     puramente interna que puede haber quedado desalineada.
+#   - El externo NUNCA se emite como su propio swing estructural aqui (ya
+#     se ve como linea azul en Overlays::ZigZag); solo corrige la
+#     referencia que usa el interno para clasificar.
+#
+# Los pivotes del ZigZag llegan con timestamp (ts), no con indice: se
+# convierten al indice local de _c (mismo espacio de indices que el resto
+# de SMC_Structures) via _ts_to_c_index.
 # -----------------------------------------------------------------------------
 sub _update_swing_structure {
     my ($self) = @_;
-    my $liq = $self->{liquidity};
-    return unless $liq;
+    my $zz = $self->{zigzag};
+    return unless $zz;
 
-    my $sh = $liq->last_swing_high;
-    if ($sh && $sh->{index} != $self->{_seen_sh_idx}) {
-        my $label = (!defined $self->{_last_sh_price})          ? 'HH'
-                  : ($sh->{price} > $self->{_last_sh_price})    ? 'HH'
-                  :                                                'LH';
-
-        push @{ $self->{_struct_swings} }, {
-            index => $sh->{index}, price => $sh->{price},
-            kind  => 'H',         label => $label, ts => $sh->{ts},
-        };
-        if ($label eq 'HH') { $self->{_last_hh} = {index=>$sh->{index}, price=>$sh->{price}}; }
-        else                 { $self->{_last_lh} = {index=>$sh->{index}, price=>$sh->{price}}; }
-
-        $self->{_last_sh_price}          = $sh->{price};
-        $self->{_seen_sh_idx}            = $sh->{index};
-        $self->{_new_sh_since_last_down} = 1;
+    # --- 1) Filtro: sincronizar primero los pivotes EXTERNOS nuevos ---
+    my $ext_segs = $zz->get_segments('external');
+    for my $j ( $self->{_seen_ext_seg_count} .. $#$ext_segs ) {
+        my $seg = $ext_segs->[$j];
+        if ($seg->{kind} eq 'H') { $self->{_last_sh_price} = $seg->{price}; }
+        else                     { $self->{_last_sl_price} = $seg->{price}; }
     }
+    $self->{_seen_ext_seg_count} = scalar @$ext_segs;
 
-    my $sl = $liq->last_swing_low;
-    if ($sl && $sl->{index} != $self->{_seen_sl_idx}) {
-        my $label = (!defined $self->{_last_sl_price})          ? 'LL'
-                  : ($sl->{price} < $self->{_last_sl_price})    ? 'LL'
-                  :                                                'HL';
+    # --- 2) Detalle: clasificar los pivotes INTERNOS nuevos ---
+    my $int_segs = $zz->get_segments('internal');
+    for my $j ( $self->{_seen_int_seg_count} .. $#$int_segs ) {
+        my $seg = $int_segs->[$j];
+        my $idx = $self->_ts_to_c_index($seg->{ts});
+        next unless defined $idx;
 
-        push @{ $self->{_struct_swings} }, {
-            index => $sl->{index}, price => $sl->{price},
-            kind  => 'L',         label => $label, ts => $sl->{ts},
-        };
-        if ($label eq 'HL') { $self->{_last_hl} = {index=>$sl->{index}, price=>$sl->{price}}; }
-        else                 { $self->{_last_ll} = {index=>$sl->{index}, price=>$sl->{price}}; }
+        if ($seg->{kind} eq 'H') {
+            my $label = (!defined $self->{_last_sh_price})        ? 'HH'
+                      : ($seg->{price} > $self->{_last_sh_price}) ? 'HH'
+                      :                                              'LH';
 
-        $self->{_last_sl_price}        = $sl->{price};
-        $self->{_seen_sl_idx}          = $sl->{index};
-        $self->{_new_sl_since_last_up} = 1;
+            push @{ $self->{_struct_swings} }, {
+                index => $idx, price => $seg->{price},
+                kind  => 'H',  label => $label, ts => $seg->{ts},
+            };
+            if ($label eq 'HH') { $self->{_last_hh} = {index=>$idx, price=>$seg->{price}}; }
+            else                 { $self->{_last_lh} = {index=>$idx, price=>$seg->{price}}; }
+
+            $self->{_last_sh_price}          = $seg->{price};
+            $self->{_new_sh_since_last_down} = 1;
+        } else {
+            my $label = (!defined $self->{_last_sl_price})        ? 'LL'
+                      : ($seg->{price} < $self->{_last_sl_price}) ? 'LL'
+                      :                                              'HL';
+
+            push @{ $self->{_struct_swings} }, {
+                index => $idx, price => $seg->{price},
+                kind  => 'L',  label => $label, ts => $seg->{ts},
+            };
+            if ($label eq 'HL') { $self->{_last_hl} = {index=>$idx, price=>$seg->{price}}; }
+            else                 { $self->{_last_ll} = {index=>$idx, price=>$seg->{price}}; }
+
+            $self->{_last_sl_price}        = $seg->{price};
+            $self->{_new_sl_since_last_up} = 1;
+        }
     }
+    $self->{_seen_int_seg_count} = scalar @$int_segs;
+}
 
-    # FIX-SMC1: sin sort en cada vela (O(n log n) * n_velas = O(n^2 log n)).
-    # Los swings de Liquidity ya llegan en orden de confirmacion (monotono
-    # creciente en index), asi que _struct_swings ya esta ordenado.
+# -----------------------------------------------------------------------------
+# _ts_to_c_index (privado): indice (en $self->{_c}, mismo espacio que el
+# resto de SMC_Structures) de la ultima vela con ts <= $ts_target. $self->{_c}
+# esta siempre ordenado ascendente por ts (se pushea una vela por llamada a
+# _process, en orden). Devuelve undef si ni la primera vela procesada llega
+# a ese ts (no deberia pasar: los pivotes del ZigZag solo se confirman con
+# ts <= al de la vela actualmente visible).
+# -----------------------------------------------------------------------------
+sub _ts_to_c_index {
+    my ($self, $ts_target) = @_;
+    my $c  = $self->{_c};
+    my $hi = $#$c;
+    return undef if $hi < 0 || $c->[0]{ts} > $ts_target;
+    return $hi if $c->[$hi]{ts} <= $ts_target;
+
+    my ($lo, $found) = (0, undef);
+    while ($lo <= $hi) {
+        my $mid = int( ($lo + $hi) / 2 );
+        if ( $c->[$mid]{ts} <= $ts_target ) { $found = $mid; $lo = $mid + 1; }
+        else                                 { $hi = $mid - 1; }
+    }
+    return $found;
 }
 
 # -----------------------------------------------------------------------------

@@ -17,7 +17,7 @@ my @DAY_NAMES = qw(Mon Tue Wed Thu Fri Sat Sun);
 # Temporalidades derivadas soportadas (todo excepto 1m, que es la base
 # alimentada directamente por add_candle).
 # -----------------------------------------------------------------------------
-my @DERIVED_TIMEFRAMES = qw(5m 15m 1h 2h 4h D W);
+my @DERIVED_TIMEFRAMES = qw(5m 15m 30m 1h 2h 4h D W);
 
 # Temporalidades intradia que se agregan por bucketing directo sobre el
 # epoch (igual que 5m/15m en Fase 1). Estos intervalos dividen exacto a
@@ -25,6 +25,7 @@ my @DERIVED_TIMEFRAMES = qw(5m 15m 1h 2h 4h D W);
 my %TF_MINUTES = (
     '5m'  => 5,
     '15m' => 15,
+    '30m' => 30,
     '1h'  => 60,
     '2h'  => 120,
     '4h'  => 240,
@@ -141,17 +142,31 @@ sub build_tf_candles {
             push @result, $current_candle if defined $current_candle;
 
             $current_candle = {
-                time   => $c->{time},  # FIX: heredar time de la 1ra vela 1m del bucket
-                ts     => $bucket_ts,
-                open   => $c->{open},
-                high   => $c->{high},
-                low    => $c->{low},
-                close  => $c->{close},
-                volume => $c->{volume},
+                time    => $c->{time},  # FIX: heredar time de la 1ra vela 1m del bucket
+                ts      => $bucket_ts,
+                open    => $c->{open},
+                high    => $c->{high},
+                low     => $c->{low},
+                close   => $c->{close},
+                volume  => $c->{volume},
+                # ts_high/ts_low: timestamp real (1m) donde ocurrio el
+                # extremo del bucket. El high/low agregado casi nunca
+                # ocurre en el primer minuto del bucket (=ts), asi que
+                # indicadores que necesitan anclar un pivote a una vela
+                # concreta (p.ej. ZigZag interno) deben usar estos, no
+                # 'ts', para no quedar flotando sobre/bajo la mecha real.
+                ts_high => $c->{ts},
+                ts_low  => $c->{ts},
             };
         } else {
-            $current_candle->{high}   = $c->{high}   if $c->{high}  > $current_candle->{high};
-            $current_candle->{low}    = $c->{low}    if $c->{low}   < $current_candle->{low};
+            if ($c->{high} > $current_candle->{high}) {
+                $current_candle->{high}    = $c->{high};
+                $current_candle->{ts_high} = $c->{ts};
+            }
+            if ($c->{low} < $current_candle->{low}) {
+                $current_candle->{low}    = $c->{low};
+                $current_candle->{ts_low} = $c->{ts};
+            }
             $current_candle->{close}  = $c->{close};
             $current_candle->{volume} += $c->{volume};
         }
