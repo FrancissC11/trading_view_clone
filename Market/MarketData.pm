@@ -162,7 +162,11 @@ sub build_tf_candles {
             push @result, $current_candle if defined $current_candle;
 
             $current_candle = {
-                time   => $c->{time},  # FIX: heredar time de la 1ra vela 1m del bucket
+                # El 'time' se deriva del bucket_ts (fecha ETIQUETA de la vela),
+                # NO de la 1ra vela 1m: en D/W la 1ra vela es la apertura de
+                # sesion (dia anterior / domingo), y la app muestra este campo.
+                # Sin esto, 1D salia atrasado 1 dia y 1W mostraba domingo.
+                time   => $self->_iso_local($bucket_ts),
                 ts     => $bucket_ts,
                 open   => $c->{open},
                 high   => $c->{high},
@@ -205,6 +209,17 @@ sub _session_close_dow {
     my $mins  = $tm->hour * 60 + $tm->minute;
     my $close = ($mins >= SESSION_OPEN_MIN) ? $tm->plus_days(1) : $tm;
     return $close->day_of_week;
+}
+
+# -----------------------------------------------------------------------------
+# _iso_local (privado): string ISO "YYYY-MM-DDThh:mm:ss-05:00" (formato del CSV)
+# a partir de un epoch, en hora local (UTC-5). Usado para el campo 'time' de las
+# velas agregadas, para que la app muestre la fecha ETIQUETA correcta.
+# -----------------------------------------------------------------------------
+sub _iso_local {
+    my ($self, $ts) = @_;
+    my $tm = Time::Moment->from_epoch($ts)->with_offset_same_instant(GMT_OFFSET_MIN);
+    return $tm->strftime('%Y-%m-%dT%H:%M:%S') . '-05:00';
 }
 
 sub build_timeframes {
