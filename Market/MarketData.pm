@@ -36,27 +36,16 @@ my %TF_MINUTES = (
 use constant GMT_OFFSET_MIN => -300;
 
 # Segundos al oeste de UTC para la zona horaria local (UTC-5).
-# Usado para anclar los buckets de temporalidades intradía
-# (especialmente 2h y 4h) a medianoche local en vez de UTC.
+# Usado para anclar los buckets de temporalidades intradía a la sesión.
 use constant LOCAL_OFFSET_SEC => 5 * 3600;
 
-# Temporalidades "a partir de 2h" (2h, 4h, D, W): en estas, sabado y domingo
-# NO se cuentan (mercado de futuros; solo lunes-viernes). Las intradia menores
-# (5m/15m/1h) NO se filtran. Ver build_tf_candles.
-my %WEEKEND_SKIP_TF = map { $_ => 1 } qw(2h 4h D W);
-
-# -----------------------------------------------------------------------------
-# _dow_local (privado)
-# Dia de la semana ISO (1=Lunes .. 7=Domingo) del ts en hora LOCAL (UTC-5),
-# calculado de forma barata desde el epoch (sin crear Time::Moment por vela).
-# El dia 0 del epoch Unix (1970-01-01) fue Jueves (=4 ISO).
-# -----------------------------------------------------------------------------
-sub _dow_local {
-    my ($ts) = @_;
-    my $days = int( ( $ts - LOCAL_OFFSET_SEC ) / 86400 );
-    $days -= 1 if ( $ts - LOCAL_OFFSET_SEC ) < 0 && ( $ts - LOCAL_OFFSET_SEC ) % 86400 != 0;
-    return ( ( $days % 7 ) + 3 ) % 7 + 1;
-}
+# Apertura de la sesion (CME Globex): 17:00 hora local (UTC-5). El "dia de
+# trading" va 17:00 -> 16:00 del dia siguiente (corte de mantenimiento diario
+# 16:00-17:00; la semana abre el domingo 17:00). Las temporalidades intradia
+# (2h/4h) y D/W se anclan a esta apertura, igual que TradingView -> asi el
+# bucket 2h de las 11:00 existe (11:00-13:00) en vez de caer en 10:00-12:00.
+use constant SESSION_OPEN_MIN => 17 * 60;      # 17:00 en minutos del dia
+use constant SESSION_OPEN_SEC => 17 * 3600;    # 17:00 en segundos del dia
 
 # -----------------------------------------------------------------------------
 # new
@@ -102,26 +91,33 @@ sub _bucket_ts_for {
     my ($self, $ts, $tf) = @_;
 
     if (exists $TF_MINUTES{$tf}) {
+        # Intradia anclado a la APERTURA DE SESION (17:00 local), no a
+        # medianoche. Como 24h es multiplo de 2h/4h, un ancla global en 17:00
+        # produce fronteras coherentes cada dia (..09:00, 11:00, 13:00.. en 2h).
+        # 5m/15m/1h no cambian (17:00 ya es frontera de esos intervalos).
         my $interval_sec = $TF_MINUTES{$tf} * 60;
-        # FIX: anclar a medianoche local (UTC-5), no UTC. La division naive
-        # es correcta para 5m/15m/1h (el offset 18000s es multiplo de 300,
-        # 900 y 3600), pero desalinea 2h y 4h porque 18000/7200=2.5 y
-        # 18000/14400=1.25. Con el fix, la primera vela de abril (00:00 UTC-5)
-        # abre correctamente a las 01:00 EDT en vez de las 23:00 del dia
-        # anterior como hacia el codigo original.
-        my $local = $ts - LOCAL_OFFSET_SEC;
-        return int($local / $interval_sec) * $interval_sec + LOCAL_OFFSET_SEC;
+        my $shifted = $ts - LOCAL_OFFSET_SEC - SESSION_OPEN_SEC;
+        return int($shifted / $interval_sec) * $interval_sec
+             + SESSION_OPEN_SEC + LOCAL_OFFSET_SEC;
     }
 
+    # Fecha de CIERRE de la sesion a la que pertenece la vela: una vela con hora
+    # local >= 17:00 pertenece a la sesion que cierra al dia SIGUIENTE (p.ej.
+    # domingo 17:00 -> sesion del lunes). Se usa para D y W.
+    my $tm    = Time::Moment->from_epoch($ts)->with_offset_same_instant(GMT_OFFSET_MIN);
+    my $mins  = $tm->hour * 60 + $tm->minute;
+    my $close = ($mins >= SESSION_OPEN_MIN) ? $tm->plus_days(1) : $tm;
+
     if ($tf eq 'D') {
-        my $tm = Time::Moment->from_epoch($ts)->with_offset_same_instant(GMT_OFFSET_MIN);
-        return $self->_truncate_to_midnight($tm)->epoch;
+        # Un dia = una sesion (17:00 -> 16:00), etiquetado por su fecha de cierre.
+        return $self->_truncate_to_midnight($close)->epoch;
     }
 
     if ($tf eq 'W') {
-        my $tm  = Time::Moment->from_epoch($ts)->with_offset_same_instant(GMT_OFFSET_MIN);
-        my $dow = $tm->day_of_week;   # 1=Lunes .. 7=Domingo (ISO 8601)
-        return $self->_truncate_to_midnight($tm)->minus_days($dow - 1)->epoch;
+        # Una semana = sesiones de lunes a viernes (domingo 17:00 -> viernes
+        # 16:00), etiquetada por el LUNES de la semana de la fecha de cierre.
+        my $dow = $close->day_of_week;   # 1=Lunes .. 7=Domingo (ISO 8601)
+        return $self->_truncate_to_midnight($close)->minus_days($dow - 1)->epoch;
     }
 
     return undef;
@@ -149,17 +145,16 @@ sub build_tf_candles {
     return unless exists $TF_MINUTES{$tf} || $tf eq 'D' || $tf eq 'W';
 
     my $src = $self->{data}{'1m'};
-    my $skip_weekend = $WEEKEND_SKIP_TF{$tf};   # 2h/4h/D/W: sin sabado/domingo
     my @result;
     my $current_candle = undef;
-    my $first_dow;                               # dia de la 1ra vela util (para W)
+    my $first_close_dow;   # dia de CIERRE de la sesion de la 1ra vela (para W)
 
     for my $c (@$src) {
-        if ($skip_weekend) {
-            my $dow = _dow_local($c->{ts});
-            next if $dow == 6 || $dow == 7;      # 6=Sabado, 7=Domingo -> no cuentan
-        }
-        $first_dow //= _dow_local($c->{ts});
+        # NOTA: ya NO se filtra sabado/domingo. El bucketing por SESION agrupa
+        # correctamente el domingo por la tarde (17:00-24:00) dentro de la
+        # sesion/semana del lunes, y no hay datos de sabado. Asi coincide con la
+        # interpretacion de velas de CME/TradingView.
+        $first_close_dow //= $self->_session_close_dow($c->{ts});
 
         my $bucket_ts = $self->_bucket_ts_for($c->{ts}, $tf);
 
@@ -191,11 +186,25 @@ sub build_tf_candles {
     # Se elimina para que la primera vela semanal sea el primer LUNES real
     # (p.ej. lunes 6-abr). Requisito del usuario: la semana va lunes->domingo y
     # arranca en lunes.
-    if ($tf eq 'W' && @result && defined $first_dow && $first_dow != 1) {
+    if ($tf eq 'W' && @result && defined $first_close_dow && $first_close_dow != 1) {
         shift @result;
     }
 
     $self->{data}{$tf} = \@result;
+}
+
+# -----------------------------------------------------------------------------
+# _session_close_dow (privado)
+# Dia de la semana ISO (1=Lun..7=Dom) de la FECHA DE CIERRE de la sesion a la
+# que pertenece $ts (>= 17:00 local -> cierra al dia siguiente). Se usa para
+# decidir si la primera semana es parcial.
+# -----------------------------------------------------------------------------
+sub _session_close_dow {
+    my ($self, $ts) = @_;
+    my $tm    = Time::Moment->from_epoch($ts)->with_offset_same_instant(GMT_OFFSET_MIN);
+    my $mins  = $tm->hour * 60 + $tm->minute;
+    my $close = ($mins >= SESSION_OPEN_MIN) ? $tm->plus_days(1) : $tm;
+    return $close->day_of_week;
 }
 
 sub build_timeframes {
