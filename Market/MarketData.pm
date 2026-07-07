@@ -5,6 +5,18 @@ package Market::MarketData;
 # Responsabilidad: almacenar y gestionar datos de mercado OHLCV.
 # Garantiza sincronizacion temporal, acceso eficiente por indice
 # y construccion de temporalidades (1m -> 5m -> 15m -> 1h -> 2h -> 4h -> D -> W).
+#
+# FIX (correccion de anclaje horario, ver diagnostico): las temporalidades
+# derivadas se anclan a MEDIANOCHE LOCAL (UTC-5), igual que TradingView.
+# Version anterior anclaba 2h/4h/D/W a la apertura de sesion CME (17:00
+# local), lo cual coincide por casualidad con medianoche para 5m/15m/30m/1h
+# (porque 17:00 = 1020 min es multiplo exacto de esos intervalos) pero NO
+# para 2h/4h (1020 no es multiplo de 120 ni de 240 -> desfase de 60 min) ni
+# para D/W (donde ademas se usaba la fecha de "cierre de sesion" en vez del
+# dia de calendario real). Se elimina por completo el concepto de "sesion
+# CME 17:00-16:00" del bucketing: todas las temporalidades derivadas usan
+# ahora el mismo criterio simple y unico -> floor a intervalo fijo anclado
+# en medianoche UTC-5.
 # =============================================================================
 
 use strict;
@@ -19,34 +31,27 @@ my @DAY_NAMES = qw(Mon Tue Wed Thu Fri Sat Sun);
 # -----------------------------------------------------------------------------
 my @DERIVED_TIMEFRAMES = qw(5m 15m 30m 1h 2h 4h D W);
 
-# Temporalidades intradia que se agregan por bucketing directo sobre el
-# epoch (igual que 5m/15m en Fase 1). Estos intervalos dividen exacto a
-# 1440 min/dia, asi que el ancla es estable sin convertir a zona local.
-my %TF_MINUTES = (
-    '5m'  => 5,
-    '15m' => 15,
-    '30m' => 30,
-    '1h'  => 60,
-    '2h'  => 120,
-    '4h'  => 240,
+# Ancho de bucket en segundos para cada temporalidad derivada de bucketing
+# DIRECTO sobre el epoch (todas menos W, que se resuelve aparte porque
+# necesita alinearse al LUNES, no a un multiplo fijo de segundos).
+my %TF_SECONDS = (
+    '5m'  => 5   * 60,
+    '15m' => 15  * 60,
+    '30m' => 30  * 60,
+    '1h'  => 60  * 60,
+    '2h'  => 120 * 60,
+    '4h'  => 240 * 60,
+    'D'   => 86400,
 );
 
-# Ancla horaria para D y W: GMT-5, consistente con el resto del sistema
-# (PricePanel/ChartEngine ya usan gmtime($ts+5*3600) para etiquetas de
-# dia/fecha). Offset en minutos para Time::Moment->from_epoch.
+# Ancla horaria: GMT-5, consistente con el resto del sistema (PricePanel/
+# ChartEngine ya usan gmtime($ts-5*3600) para etiquetas de dia/fecha).
+# Offset en minutos para Time::Moment->from_epoch.
 use constant GMT_OFFSET_MIN => -300;
 
-# Segundos al oeste de UTC para la zona horaria local (UTC-5).
-# Usado para anclar los buckets de temporalidades intradía a la sesión.
+# Segundos al oeste de UTC para la zona horaria local (UTC-5). Usado para
+# anclar TODOS los buckets (intradia, D y W) a medianoche LOCAL.
 use constant LOCAL_OFFSET_SEC => 5 * 3600;
-
-# Apertura de la sesion (CME Globex): 17:00 hora local (UTC-5). El "dia de
-# trading" va 17:00 -> 16:00 del dia siguiente (corte de mantenimiento diario
-# 16:00-17:00; la semana abre el domingo 17:00). Las temporalidades intradia
-# (2h/4h) y D/W se anclan a esta apertura, igual que TradingView -> asi el
-# bucket 2h de las 11:00 existe (11:00-13:00) en vez de caer en 10:00-12:00.
-use constant SESSION_OPEN_MIN => 17 * 60;      # 17:00 en minutos del dia
-use constant SESSION_OPEN_SEC => 17 * 3600;    # 17:00 en segundos del dia
 
 # -----------------------------------------------------------------------------
 # new
@@ -82,88 +87,62 @@ sub add_candle {
 
 # -----------------------------------------------------------------------------
 # _bucket_ts_for (privado)
-# Calcula el timestamp de "inicio de bucket" para una vela 1m dada,
-# segun la temporalidad destino. Centraliza la decision de anclaje:
-#   - 5m/15m/1h/2h/4h -> bucketing directo sobre el epoch (UTC).
-#   - D               -> medianoche GMT-5.
-#   - W               -> 00:00 del lunes en GMT-5.
+# Calcula el timestamp de "inicio de bucket" para una vela 1m dada, segun la
+# temporalidad destino. Un UNICO criterio para todas: ancla a MEDIANOCHE
+# LOCAL (UTC-5) -- igual que TradingView.
+#   - 5m/15m/30m/1h/2h/4h/D -> floor directo sobre el epoch, anclado a
+#     medianoche local (ancho fijo en TF_SECONDS).
+#   - W -> se apoya en el bucket 'D' (medianoche del dia) y retrocede hasta
+#     el LUNES de esa semana.
 # -----------------------------------------------------------------------------
 sub _bucket_ts_for {
     my ($self, $ts, $tf) = @_;
 
-    if (exists $TF_MINUTES{$tf}) {
-        # Intradia anclado a la APERTURA DE SESION (17:00 local), no a
-        # medianoche. Como 24h es multiplo de 2h/4h, un ancla global en 17:00
-        # produce fronteras coherentes cada dia (..09:00, 11:00, 13:00.. en 2h).
-        # 5m/15m/1h no cambian (17:00 ya es frontera de esos intervalos).
-        my $interval_sec = $TF_MINUTES{$tf} * 60;
-        my $shifted = $ts - LOCAL_OFFSET_SEC - SESSION_OPEN_SEC;
-        return int($shifted / $interval_sec) * $interval_sec
-             + SESSION_OPEN_SEC + LOCAL_OFFSET_SEC;
-    }
-
-    # Sesion CME a la que pertenece la vela (17:00 -> 16:00 del dia siguiente),
-    # etiquetada por su TRADE DATE = fecha de CIERRE (convencion CME/TradingView):
-    #   * hora local >= 17:00  -> la sesion CIERRA manana (trade date = manana).
-    #   * hora local <  17:00  -> la sesion CIERRA hoy    (trade date = hoy).
-    my $tm    = Time::Moment->from_epoch($ts)->with_offset_same_instant(GMT_OFFSET_MIN);
-    my $mins  = $tm->hour * 60 + $tm->minute;
-    my $close = ($mins >= SESSION_OPEN_MIN) ? $tm->plus_days(1) : $tm;
-
-    if ($tf eq 'D') {
-        # Un dia = una sesion (17:00 -> 16:00 del dia siguiente), etiquetado por
-        # su TRADE DATE (fecha de cierre) -- asi las FECHAS de 1D coinciden con
-        # TradingView para futuros CME. El color de dias sueltos como 7-may /
-        # 4-jun difiere de TV por el FEED de datos / sesion RTH, NO por el
-        # bucketing: se probo por fuerza bruta que ningun criterio de agrupacion
-        # diaria sobre este CSV los pone verdes a ambos a la vez.
-        return $self->_truncate_to_midnight($close)->epoch;
-    }
-
     if ($tf eq 'W') {
-        # Una semana = sesiones de domingo 17:00 -> viernes 16:00, etiquetada por
-        # el LUNES de la semana. Se agrupa por la fecha de CIERRE (lunes..viernes,
-        # cuyo lunes ISO es estable), de modo que la vela del domingo por la tarde
-        # (cierra el lunes) cae correctamente en la semana que ABRE ese domingo.
-        my $dow = $close->day_of_week;   # 1=Lunes .. 7=Domingo (ISO 8601)
-        return $self->_truncate_to_midnight($close)->minus_days($dow - 1)->epoch;
+        my $day_bucket = $self->_bucket_ts_for($ts, 'D');   # medianoche local del dia
+        my $dow = $self->_local_dow($day_bucket);           # 1=Lunes .. 7=Domingo
+        return $day_bucket - ($dow - 1) * 86400;
     }
 
-    return undef;
+    return undef unless exists $TF_SECONDS{$tf};
+    my $interval_sec = $TF_SECONDS{$tf};
+    my $local = $ts - LOCAL_OFFSET_SEC;
+    return int($local / $interval_sec) * $interval_sec + LOCAL_OFFSET_SEC;
 }
 
 # -----------------------------------------------------------------------------
-# _truncate_to_midnight (privado)
-# Trunca un Time::Moment a las 00:00:00.000000000 de su mismo dia/offset.
-# Existe porque esta version de Time::Moment no expone at_start_of_day.
+# _local_dow (privado)
+# Dia de la semana ISO (1=Lunes..7=Domingo) del dia de CALENDARIO local
+# (UTC-5) al que pertenece $ts. Reemplaza a la vieja _session_close_dow:
+# ya no importa la "sesion" CME, solo el dia de calendario real.
 # -----------------------------------------------------------------------------
-sub _truncate_to_midnight {
-    my ($self, $tm) = @_;
-    return $tm->with_hour(0)->with_minute(0)->with_second(0)->with_nanosecond(0);
+sub _local_dow {
+    my ($self, $ts) = @_;
+    my $tm = Time::Moment->from_epoch($ts)->with_offset_same_instant(GMT_OFFSET_MIN);
+    return $tm->day_of_week;
 }
 
 # -----------------------------------------------------------------------------
 # build_tf_candles
-# FIX: Agrupacion anclada al reloj (Clock-Aligned Grouping), generalizada
-# a las 7 temporalidades derivadas. _bucket_ts_for decide la frontera
-# correcta (epoch o calendario GMT-5 segun el caso), resolviendo desfases
+# Agrupacion anclada al reloj (Clock-Aligned Grouping), generalizada a las 7
+# temporalidades derivadas. _bucket_ts_for decide la frontera correcta
+# (siempre medianoche local, ver cabecera del archivo), resolviendo desfases
 # y huecos de mercado (missing candles) igual que en Fase 1.
 # -----------------------------------------------------------------------------
 sub build_tf_candles {
     my ($self, $tf) = @_;
-    return unless exists $TF_MINUTES{$tf} || $tf eq 'D' || $tf eq 'W';
+    return unless exists $TF_SECONDS{$tf} || $tf eq 'W';
 
     my $src = $self->{data}{'1m'};
     my @result;
     my $current_candle = undef;
-    my $first_close_dow;   # dia de CIERRE de la sesion de la 1ra vela (para W)
+    my $first_dow;   # dia de calendario (LOCAL) de la 1ra vela (para descarte de semana parcial)
 
     for my $c (@$src) {
-        # NOTA: ya NO se filtra sabado/domingo. El bucketing por SESION agrupa
-        # correctamente el domingo por la tarde (17:00-24:00) dentro de la
-        # sesion/semana del lunes, y no hay datos de sabado. Asi coincide con la
-        # interpretacion de velas de CME/TradingView.
-        $first_close_dow //= $self->_session_close_dow($c->{ts});
+        # Ya no se filtra sabado/domingo: el domingo por la tarde (17:00 en
+        # adelante) simplemente cae en su propio dia de calendario (domingo),
+        # igual que TradingView (vela de domingo chica, separada del lunes).
+        $first_dow //= $self->_local_dow($c->{ts});
 
         my $bucket_ts = $self->_bucket_ts_for($c->{ts}, $tf);
 
@@ -171,10 +150,6 @@ sub build_tf_candles {
             push @result, $current_candle if defined $current_candle;
 
             $current_candle = {
-                # El 'time' se deriva del bucket_ts (fecha ETIQUETA de la vela),
-                # NO de la 1ra vela 1m: en D/W la 1ra vela es la apertura de
-                # sesion (dia anterior / domingo), y la app muestra este campo.
-                # Sin esto, 1D salia atrasado 1 dia y 1W mostraba domingo.
                 time   => $self->_iso_local($bucket_ts),
                 ts     => $bucket_ts,
                 open   => $c->{open},
@@ -196,28 +171,12 @@ sub build_tf_candles {
     # W: descartar la SEMANA PARCIAL inicial. Si los datos empiezan a mitad de
     # semana (p.ej. miercoles 1-abr), la 1ra vela semanal quedaria anclada al
     # lunes anterior (sin datos ese lunes/martes) -> es una semana incompleta.
-    # Se elimina para que la primera vela semanal sea el primer LUNES real
-    # (p.ej. lunes 6-abr). Requisito del usuario: la semana va lunes->domingo y
-    # arranca en lunes.
-    if ($tf eq 'W' && @result && defined $first_close_dow && $first_close_dow != 1) {
+    # Se elimina para que la primera vela semanal sea el primer LUNES real.
+    if ($tf eq 'W' && @result && defined $first_dow && $first_dow != 1) {
         shift @result;
     }
 
     $self->{data}{$tf} = \@result;
-}
-
-# -----------------------------------------------------------------------------
-# _session_close_dow (privado)
-# Dia de la semana ISO (1=Lun..7=Dom) de la FECHA DE CIERRE de la sesion a la
-# que pertenece $ts (>= 17:00 local -> cierra al dia siguiente). Se usa para
-# decidir si la primera semana es parcial.
-# -----------------------------------------------------------------------------
-sub _session_close_dow {
-    my ($self, $ts) = @_;
-    my $tm    = Time::Moment->from_epoch($ts)->with_offset_same_instant(GMT_OFFSET_MIN);
-    my $mins  = $tm->hour * 60 + $tm->minute;
-    my $close = ($mins >= SESSION_OPEN_MIN) ? $tm->plus_days(1) : $tm;
-    return $close->day_of_week;
 }
 
 # -----------------------------------------------------------------------------
@@ -344,18 +303,15 @@ sub raw_get_candle {
 
 # -----------------------------------------------------------------------------
 # tf_interval_seconds (Etapa 6, Fase 2)
-# Ancho de bucket en segundos para una temporalidad dada. Para 1m/5m/15m/
-# 1h/2h/4h es fijo (TF_MINUTES*60); para D y W tambien es fijo (86400 y
-# 7*86400) porque ambos se anclan a un punto de calendario regular (medianoche
-# GMT-5, lunes 00:00 GMT-5) con ancho constante. Uso: calcular la ventana
-# [ts, ts+interval) de la vela "macro" activa para el pesado de volumen
-# multi-temporal.
+# Ancho de bucket en segundos para una temporalidad dada. Uso: calcular la
+# ventana [ts, ts+interval) de la vela "macro" activa para el pesado de
+# volumen multi-temporal.
 # -----------------------------------------------------------------------------
-my %TF_SECONDS_FIXED = ( 'D' => 86400, 'W' => 7 * 86400 );
+my %TF_SECONDS_FIXED = ( 'W' => 7 * 86400 );
 
 sub tf_interval_seconds {
     my ( $self, $tf ) = @_;
-    return $TF_MINUTES{$tf} * 60 if exists $TF_MINUTES{$tf};
+    return $TF_SECONDS{$tf}       if exists $TF_SECONDS{$tf};
     return $TF_SECONDS_FIXED{$tf} if exists $TF_SECONDS_FIXED{$tf};
     return undef;   # '1m' u otra clave desconocida: no aplica bucket derivado
 }
