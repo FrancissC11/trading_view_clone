@@ -321,6 +321,18 @@ sub _render_obs {
 #   Interno (ZigZag verde/rojo, scope='internal') -> linea PUNTEADA, chip chico
 #   Externo (ZigZag azul, estructura mayor, scope='external') -> linea SOLIDA,
 #           chip normal
+#
+# FIX (observacion profesor -- BOS/CHoCH externo desaparecia con el zoom):
+# antes solo se comprobaba si e->{index} (la vela de CONFIRMACION) caia dentro
+# de la ventana visible [$off, $off+$vb]. La linea real va de $oi (origen del
+# pivote) a e->{index}, y en estructura EXTERNA ese tramo puede abarcar
+# cientos de velas -- si el usuario hacia zoom de forma que la ventana caia
+# ENTRE oi e index (ninguno de los dos extremos visible, pero el segmento SI
+# cruza la pantalla), el evento se descartaba entero y el BOS desaparecia.
+# Ahora se compara el RANGO [min(oi,index), max(oi,index)] contra la ventana
+# visible (mismo criterio de solape que ya usa Overlays::ZigZag::_render_zz),
+# asi el segmento se sigue dibujando (recortado por clamp de X mas abajo)
+# mientras cruce la pantalla, sin importar donde esten sus extremos.
 # =============================================================================
 sub _render_events {
     my ($self, $canvas, $scale, $src, $placer) = @_;
@@ -337,13 +349,17 @@ sub _render_events {
         next if !$is_choch && !$self->{show_bos};
         next if  $is_choch && !$self->{show_choch};
 
-        next if $e->{index} < $off || $e->{index} > $off + $vb;
+        my $oi = defined($e->{origin}) ? $e->{origin} : $e->{index} - 6;
+
+        # Visible si el rango [oi, index] se solapa con la ventana [off, off+vb]
+        # -- no solo si el punto de confirmacion cae dentro (ver nota arriba).
+        my ($idx_lo, $idx_hi) = $oi <= $e->{index} ? ($oi, $e->{index}) : ($e->{index}, $oi);
+        next if $idx_hi < $off || $idx_lo > $off + $vb;
         next unless $scale->value_in_range($e->{price});
 
         my $color  = ($e->{dir} eq 'up') ? C_BULL : C_BEAR;
         my $is_ext = (($e->{scope} // 'internal') eq 'external');
 
-        my $oi = defined($e->{origin}) ? $e->{origin} : $e->{index} - 6;
         my $x1 = $scale->index_to_center_x($oi);
         my $x2 = $scale->index_to_center_x($e->{index});
         $x1 = 0       if $x1 < 0;
