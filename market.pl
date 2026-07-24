@@ -750,7 +750,8 @@ my $make_chk = sub {
 # =============================================================================
 # Columna SMC STRUCTURES (Estructura HH/HL/LH/LL / BOS / CHoCH / FVG / OB)
 # =============================================================================
-my %SMC = ( show_struct => 0, show_fvg => 0, show_bos => 0, show_choch => 0, show_obs => 0 );
+my %SMC = ( show_struct => 0, show_fvg => 0, show_bos => 0, show_choch => 0,
+            show_obs_int => 0, show_obs_ext => 0 );
 my $smc_master = 0;
 my $refresh_smc = sub {
     $smc_overlay->set_flag($_, $SMC{$_}) for keys %SMC;
@@ -773,7 +774,8 @@ $make_chk->($col_smc, 'Estructura (HH/HL/LH/LL)', \$SMC{show_struct}, $leaf_smc)
 $make_chk->($col_smc, 'BOS',       \$SMC{show_bos},   $leaf_smc);
 $make_chk->($col_smc, 'CHoCH',     \$SMC{show_choch}, $leaf_smc);
 $make_chk->($col_smc, 'FVG',       \$SMC{show_fvg},   $leaf_smc);
-$make_chk->($col_smc, 'Order Blocks', \$SMC{show_obs}, $leaf_smc);
+$make_chk->($col_smc, 'Order Blocks Internos', \$SMC{show_obs_int}, $leaf_smc);
+$make_chk->($col_smc, 'Order Blocks Externos', \$SMC{show_obs_ext}, $leaf_smc);
 
 # =============================================================================
 # Columna LIQUIDITY (Swing / BSL / SSL / EQH / EQL / Sweeps / Grabs / Runs)

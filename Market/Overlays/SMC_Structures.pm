@@ -15,8 +15,9 @@ package Market::Overlays::SMC_Structures;
 #         Externo  -> linea SOLIDA,   etiqueta normal
 #   - FVG: caja que empieza DESPUES de la 3a vela, solo los 'significant',
 #           con desvanecimiento progresivo por edad y consumo parcial
-#   - Order Blocks: cajas de demand/supply, solo cuando el precio esta
-#           dentro de ob_proximity_mult*ATR; si coincide con FVG muestra "OB"
+#   - Order Blocks: cajas de demand/supply, limitadas a los N mas recientes
+#           ACTIVOS por scope (interno/externo, checkboxes independientes);
+#           si coincide con FVG muestra "OB" en vez de "FVG"
 # =============================================================================
 
 use strict;
@@ -49,11 +50,19 @@ sub new {
         show_fvg    => $args{show_fvg}   // 1,
         show_bos    => $args{show_bos}   // 1,
         show_choch  => $args{show_choch} // 1,
-        show_obs    => $args{show_obs}   // 1,
+        show_obs_int => $args{show_obs_int} // 1,   # Order Blocks internos (scope='internal')
+        show_obs_ext => $args{show_obs_ext} // 1,   # Order Blocks externos (scope='external')
     }, $class;
 }
 
 sub tag { return TAG; }
+
+# _ob_visible: respeta los checkboxes independientes de OB interno/externo.
+sub _ob_visible {
+    my ($self, $ob) = @_;
+    my $is_ext = (($ob->{scope} // 'internal') eq 'external');
+    return $is_ext ? $self->{show_obs_ext} : $self->{show_obs_int};
+}
 
 sub set_flag {
     my ($self, $flag, $val) = @_;
@@ -69,7 +78,8 @@ sub render {
     # y ChartEngine las coloca al final evitando velas y otras etiquetas. Si no
     # se pasa placer, se cae al chip inmediato de siempre (compatibilidad).
     $self->_render_fvgs($canvas, $scale, $src, $placer)   if $self->{show_fvg};
-    $self->_render_obs($canvas, $scale, $src, $placer)    if $self->{show_obs};
+    $self->_render_obs($canvas, $scale, $src, $placer)
+        if $self->{show_obs_int} || $self->{show_obs_ext};
     $self->_render_struct($canvas, $scale, $src, $placer) if $self->{show_struct};
     $self->_render_events($canvas, $scale, $src, $placer)
         if $self->{show_bos} || $self->{show_choch};
@@ -161,9 +171,10 @@ sub _render_fvgs {
     my $bar_w  = $plot_w / $scale->{visible_bars};
     my $last_close = $scale->{last_close} // 0;
 
-    # Obtener OBs activos para detectar overlap
+    # Obtener OBs activos y VISIBLES (respeta los checkboxes interno/externo)
+    # para detectar overlap -- un OB oculto no debe tapar el FVG.
     my $obs = $src->get_order_blocks // [];
-    my @active_obs = grep { $_->{state} eq 'active' } @$obs;
+    my @active_obs = grep { $_->{state} eq 'active' && $self->_ob_visible($_) } @$obs;
 
     for my $f (@$fvgs) {
         next unless $f->{significant};
@@ -251,35 +262,38 @@ sub _render_fvgs {
 }
 
 # =============================================================================
-# Order Blocks: demand (bull) o supply (bear), solo cuando el precio esta
-# cerca (dentro de ob_proximity_mult * ATR). Soporte abajo, resistencia arriba.
+# Order Blocks: demand (bull) o supply (bear). LuxAlgo NO filtra por distancia
+# al precio -- solo limita cuantos OB ACTIVOS se muestran por scope (Pine:
+# intOBCntInp / swOBCntInp, default 5 cada uno), quedandose con los N MAS
+# RECIENTES. Antes este overlay ocultaba cualquier OB a mas de
+# ob_proximity_mult*ATR del ultimo cierre, lo que hacia desaparecer OBs
+# validos (p.ej. uno bajista de mediados de julio en 1h) simplemente porque el
+# precio ya no rondaba cerca -- eso NO ocurre en el indicador original.
 # =============================================================================
 sub _render_obs {
     my ($self, $canvas, $scale, $src, $placer) = @_;
     my $obs = $src->get_order_blocks or return;
     return unless @$obs;
 
-    my $off       = $scale->{offset};
-    my $vb        = $scale->{visible_bars};
-    my $plot_w    = $scale->_plot_w;
-    my $last_close = $scale->{last_close} // 0;
+    my $plot_w = $scale->_plot_w;
 
-    # ATR aproximado: usar el rango de precio visible como proxy si no disponible
-    my $price_range = $scale->{max_val} - $scale->{min_val};
-    my $atr_proxy   = $price_range * 0.05;   # 5% del rango visible como ATR aproximado
+    my $int_cnt = $self->{ob_int_count} // 5;
+    my $ext_cnt = $self->{ob_ext_count} // 5;
 
-    my $proximity = $self->{source}{ob_proximity_mult} // 6.0;
-
+    my (@active_int, @active_ext);
     for my $ob (@$obs) {
         next if $ob->{state} eq 'broken';
+        next unless $self->_ob_visible($ob);
+        if ((($ob->{scope} // 'internal') eq 'external')) { push @active_ext, $ob; }
+        else                                               { push @active_int, $ob; }
+    }
+    # _order_blocks esta en orden cronologico (push): los mas nuevos quedan al
+    # final -- igual que el unshift+slice(0,maxOBs) de Pine, solo que aqui la
+    # lista crece por el otro extremo, asi que tomamos la COLA.
+    @active_int = splice(@active_int, -$int_cnt) if @active_int > $int_cnt;
+    @active_ext = splice(@active_ext, -$ext_cnt) if @active_ext > $ext_cnt;
 
-        # Solo mostrar si el precio esta cerca del OB
-        my $dist = ($ob->{dir} eq 'bull')
-            ? $last_close - $ob->{zone_high}
-            : $ob->{zone_low} - $last_close;
-        next if $dist > $proximity * $atr_proxy && $last_close != 0;
-        next if $dist < -$atr_proxy * 2;   # precio ya paso a traves del OB
-
+    for my $ob (@active_int, @active_ext) {
         next unless $scale->value_in_range($ob->{zone_high})
                  || $scale->value_in_range($ob->{zone_low});
 
