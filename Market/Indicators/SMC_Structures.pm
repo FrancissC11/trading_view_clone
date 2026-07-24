@@ -25,7 +25,6 @@ sub new {
         liquidity          => $args{liquidity},
         max_age            => $args{max_age}           // 50,
         min_fvg_atr_mult   => $args{min_fvg_atr_mult}  // 0.20,
-        ob_proximity_mult  => $args{ob_proximity_mult}  // 6.0,
 
         _c            => [],
         _fvgs         => [],
@@ -33,6 +32,12 @@ sub new {
         _events       => [],
         _order_blocks => [],
         _active_obs   => [],
+        # parsedHigh/parsedLow por vela (LuxAlgo): en velas de alta volatilidad
+        # (rango >= 2*ATR) se INTERCAMBIAN high/low para que el ancla del Order
+        # Block no quede en la mecha extrema de una vela anomala. Alimentan
+        # _find_order_block (ver mas abajo).
+        _parsed_hi    => [],
+        _parsed_lo    => [],
 
         # FASE-2.2: integracion Liquidity -> SMC (relaciones, paso 8 por vela).
         _liq_seen         => 0,    # cursor: nº de eventos de Liquidity ya consumidos
@@ -101,6 +106,8 @@ sub reset {
     $self->{_events}       = [];
     $self->{_order_blocks} = [];
     $self->{_active_obs}   = [];
+    $self->{_parsed_hi}    = [];
+    $self->{_parsed_lo}    = [];
     $self->{_liq_seen}        = 0;    # FASE-2.2: cursor y buffers de relaciones
     $self->{_liq_recent}      = [];
     $self->{_reversal_alerts} = [];
@@ -132,6 +139,7 @@ sub _process {
     $self->_sync_from_zigzag;          # (5) estructura HH/HL/LH/LL
     $self->_detect_fvg($i);            # (7) FVG (no interactua con BOS/CHoCH)
     $self->_update_fvgs($i);
+    $self->_compute_parsed_extremes($i);   # parsedHigh/parsedLow (ancla de OB)
     $self->_update_obs($i);
     $self->_detect_bos_choch($i);      # (6) BOS/CHoCH
     $self->_apply_liquidity_relations($i);   # (8) relaciones Liquidity -> SMC
@@ -442,37 +450,70 @@ sub _emit {
     }
 }
 
-sub _find_order_block {
-    my ($self, $dir, $start, $end) = @_;
-    my $c = $self->{_c};
-    for (my $j = $end; $j >= $start; $j--) {
-        my $candle = $c->[$j] or next;
-        if ($dir eq 'bull' && $candle->{close} < $candle->{open}) {
-            return { dir=>'bull', idx=>$j, ts=>$candle->{ts},
-                     zone_low=>$candle->{low}, zone_high=>$candle->{open},
-                     open=>$candle->{open}, high=>$candle->{high},
-                     low=>$candle->{low},   close=>$candle->{close},
-                     state=>'active', broken_at=>undef };
-        }
-        if ($dir eq 'bear' && $candle->{close} > $candle->{open}) {
-            return { dir=>'bear', idx=>$j, ts=>$candle->{ts},
-                     zone_low=>$candle->{open}, zone_high=>$candle->{high},
-                     open=>$candle->{open}, high=>$candle->{high},
-                     low=>$candle->{low},   close=>$candle->{close},
-                     state=>'active', broken_at=>undef };
-        }
-    }
-    return undef;
+# _compute_parsed_extremes: parsedHigh/parsedLow de LuxAlgo (Pine:
+# highVolatilityBar = (high-low) >= 2*volMeasure; parsedHigh = highVol ? low :
+# high; parsedLow = highVol ? high : low). volMeasure usa el ATR ya disponible
+# en el indicador (equivalente al filtro "ATR" de obFilterInp, el default del
+# script). Se guarda 1:1 alineado con _c para que _find_order_block pueda
+# buscar el extremo del tramo tal como hace storeOrderBlock() en Pine.
+sub _compute_parsed_extremes {
+    my ($self, $i) = @_;
+    my $c   = $self->{_c}[$i];
+    my $vol = $self->{atr} ? ($self->{atr}->get_values->[$i] // 0) : 0;
+    my $high_vol_bar = ($vol > 0) && (($c->{high} - $c->{low}) >= (2 * $vol));
+    push @{ $self->{_parsed_hi} }, $high_vol_bar ? $c->{low}  : $c->{high};
+    push @{ $self->{_parsed_lo} }, $high_vol_bar ? $c->{high} : $c->{low};
 }
 
+# _find_order_block: replica storeOrderBlock() de LuxAlgo -- NO busca "la
+# ultima vela de color contrario", busca la vela con el EXTREMO parseado del
+# tramo [start..end] (bull: parsedLow minimo: origen del impulso alcista;
+# bear: parsedHigh maximo: origen del impulso bajista). La caja resultante es
+# el rango high/low (parseado) de ESA UNICA vela, igual que
+# orderBlock.new(parsedHighs.get(idx), parsedLows.get(idx), ...) en Pine.
+sub _find_order_block {
+    my ($self, $dir, $start, $end) = @_;
+    $start = 0 if $start < 0;
+    return undef if $end < $start;
+
+    my $c  = $self->{_c};
+    my $hi = $self->{_parsed_hi};
+    my $lo = $self->{_parsed_lo};
+
+    my $idx = $start;
+    if ($dir eq 'bull') {
+        for (my $j = $start + 1; $j <= $end; $j++) {
+            $idx = $j if $lo->[$j] < $lo->[$idx];
+        }
+    } else {
+        for (my $j = $start + 1; $j <= $end; $j++) {
+            $idx = $j if $hi->[$j] > $hi->[$idx];
+        }
+    }
+
+    my $candle = $c->[$idx] or return undef;
+    my ($zh, $zl) = ($hi->[$idx], $lo->[$idx]);
+    ($zh, $zl) = ($zl, $zh) if $zh < $zl;   # vela de alta volatilidad: high/low intercambiados
+
+    return { dir=>$dir, idx=>$idx, ts=>$candle->{ts},
+             zone_high=>$zh, zone_low=>$zl,
+             open=>$candle->{open}, high=>$candle->{high},
+             low=>$candle->{low},   close=>$candle->{close},
+             state=>'active', broken_at=>undef };
+}
+
+# _update_obs: mitigacion por MECHA (obMitigInp default = "High / Low" en
+# Pine), no por cierre -- bearMitSrc/bullMitSrc = high/low. Un OB bajista
+# (supply) se invalida cuando el HIGH supera su tope; uno alcista (demand)
+# cuando el LOW perfora su piso.
 sub _update_obs {
     my ($self, $i) = @_;
     my $cur = $self->{_c}[$i];
     my @keep;
     for my $ob (@{ $self->{_active_obs} }) {
         next if $i <= $ob->{idx};
-        if ($ob->{dir} eq 'bull' && $cur->{close} < $ob->{zone_low})  { $ob->{state}='broken'; $ob->{broken_at}=$i; next; }
-        if ($ob->{dir} eq 'bear' && $cur->{close} > $ob->{zone_high}) { $ob->{state}='broken'; $ob->{broken_at}=$i; next; }
+        if ($ob->{dir} eq 'bull' && $cur->{low}  < $ob->{zone_low})  { $ob->{state}='broken'; $ob->{broken_at}=$i; next; }
+        if ($ob->{dir} eq 'bear' && $cur->{high} > $ob->{zone_high}) { $ob->{state}='broken'; $ob->{broken_at}=$i; next; }
         push @keep, $ob;
     }
     $self->{_active_obs} = \@keep;
